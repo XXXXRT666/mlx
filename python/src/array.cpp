@@ -479,7 +479,7 @@ void init_array(nb::module_& m) {
               throw std::invalid_argument(
                   "Invalid pickle state: expected (ndarray, Dtype::Val)");
             }
-            using ND = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+            using ND = nb::ndarray<nb::ro, nb::c_contig>;
             ND nd = nb::cast<ND>(state[0]);
             auto val = static_cast<mx::Dtype::Val>(nb::cast<uint8_t>(state[1]));
             if (val == mx::Dtype::Val::bfloat16) {
