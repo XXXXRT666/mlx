@@ -2,8 +2,6 @@
 
 #include "python/src/mlx_func.h"
 
-#include <structmember.h>
-
 // A garbage collected function which wraps nb::cpp_function
 // See https://github.com/wjakob/nanobind/discussions/919
 
