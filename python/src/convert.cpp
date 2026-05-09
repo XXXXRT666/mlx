@@ -501,17 +501,15 @@ mx::array create_array(nb::object v, std::optional<mx::Dtype> t) {
     return mx::astype(arr, t.value_or(arr.dtype()));
   } else if (nb::ndarray_check(v)) {
     using ContigArray = nb::ndarray<nb::ro, nb::c_contig>;
-    nb::object src = v;
     ContigArray nd;
     std::optional<nb::dlpack::dtype> nb_dtype;
     // Nanobind does not recognize bfloat16 numpy array:
     // https://github.com/wjakob/nanobind/discussions/560
-    if (nb::hasattr(src, "dtype") &&
-        src.attr("dtype").equal(nb::str("bfloat16"))) {
-      nd = nb::cast<ContigArray>(src.attr("view")("uint16"));
+    if (nb::hasattr(v, "dtype") && v.attr("dtype").equal(nb::str("bfloat16"))) {
+      nd = nb::cast<ContigArray>(v.attr("view")("uint16"));
       nb_dtype = nb::dtype<mx::bfloat16_t>();
     } else {
-      nd = nb::cast<ContigArray>(src);
+      nd = nb::cast<ContigArray>(v);
     }
     return nd_array_to_mlx(nd, t, nb_dtype);
   } else {
