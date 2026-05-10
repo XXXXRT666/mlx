@@ -76,6 +76,10 @@ void* Buffer::raw_ptr() {
   return static_cast<size_t*>(ptr_) + 1;
 }
 
+bool Buffer::is_host_accessible() const {
+  return true;
+}
+
 Buffer CommonAllocator::malloc(size_t size) {
   void* ptr = std::malloc(size + sizeof(size_t));
   if (ptr != nullptr) {
