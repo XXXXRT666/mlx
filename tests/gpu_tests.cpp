@@ -1,6 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <future>
 
 #include "doctest/doctest.h"
 #include "mlx/mlx.h"
@@ -520,4 +523,43 @@ TEST_CASE("test memory info") {
 
   clear_cache();
   CHECK_EQ(get_cache_memory(), 0);
+}
+
+TEST_CASE("test scatter_prod with NaN does not hang") {
+  // Regression test for the NaN CAS workaround in atomic.h. The std::async
+  // timeout converts a wedged GPU into a test failure.
+  auto run_with_timeout = [](auto fn) {
+    auto fut = std::async(std::launch::async, std::move(fn));
+    REQUIRE(
+        fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    return fut.get();
+  };
+
+  float nan = std::nanf("");
+
+  // NaN-valued update colliding with a normal update on the same slot.
+  {
+    auto out = run_with_timeout([&] {
+      auto x = array({1.0f, 1.0f, 1.0f, 1.0f});
+      auto idx = array({0, 0});
+      auto upd = array({nan, 2.0f}, {2, 1});
+      auto y = scatter_prod(x, idx, upd, 0, Device::gpu);
+      eval(y);
+      return y;
+    });
+    CHECK(std::isnan(out.data<float>()[0]));
+  }
+
+  // NaN already in memory before any update lands.
+  {
+    auto out = run_with_timeout([&] {
+      auto x = array({nan, 1.0f, 1.0f, 1.0f});
+      auto idx = array({0, 0});
+      auto upd = array({2.0f, 3.0f}, {2, 1});
+      auto y = scatter_prod(x, idx, upd, 0, Device::gpu);
+      eval(y);
+      return y;
+    });
+    CHECK(std::isnan(out.data<float>()[0]));
+  }
 }
