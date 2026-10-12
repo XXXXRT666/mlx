@@ -94,6 +94,7 @@ are the CPU and GPU.
    :maxdepth: 1
 
    dev/extensions
+   dev/compile
    dev/metal_debugger
    dev/metal_logging
    dev/custom_metal_kernels
