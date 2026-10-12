@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <map>
 #include <optional>
-#include <span>
 
 #include <fmt/format.h>
 
@@ -85,7 +84,7 @@ struct VecU64Hash {
   }
 };
 
-void deduplicate_scalars(CompileGraph& graph, const CompileContext&) {
+void deduplicate_scalars(CompileGraph& graph, const CompileContext& context) {
   std::map<std::pair<uint64_t, Dtype::Val>, array> scalars;
   auto is_scalar = [](const array& a) {
     return a.is_available() && a.ndim() == 0;
@@ -121,9 +120,14 @@ void deduplicate_scalars(CompileGraph& graph, const CompileContext&) {
     }
   }
   graph.replace_outputs(old_scalars, new_scalars);
+  if (context.log.enabled(CompileLogCategory::Passes)) {
+    for (size_t i = 0; i < old_scalars.size(); ++i) {
+      context.log_rewrite("same_scalar", old_scalars[i], new_scalars[i]);
+    }
+  }
 }
 
-void remove_noops(CompileGraph& graph, const CompileContext&) {
+void remove_noops(CompileGraph& graph, const CompileContext& context) {
   // Worklists hold candidates only; graph queries are refreshed after rewrites.
   auto candidates = graph.tape();
   std::reverse(candidates.begin(), candidates.end());
@@ -132,6 +136,7 @@ void remove_noops(CompileGraph& graph, const CompileContext&) {
     candidates.pop_back();
     if (graph.contains(a) && a.has_primitive() && is_noop(a.primitive())) {
       graph.replace_outputs({a}, {a.inputs()[0]});
+      context.log_rewrite("remove_noop", a, a.inputs()[0]);
     }
   }
 }
@@ -197,7 +202,14 @@ void eliminate_common_subexpressions(
     if (match == group.end()) {
       group.push_back(a);
     } else {
-      graph.replace_outputs(outputs, match->outputs());
+      auto replacements = match->outputs();
+      graph.replace_outputs(outputs, replacements);
+      if (context.log.enabled(CompileLogCategory::Passes)) {
+        for (size_t i = 0; i < outputs.size(); ++i) {
+          context.log_rewrite(
+              "equivalent_primitive", outputs[i], replacements[i]);
+        }
+      }
     }
   }
 }
@@ -223,6 +235,9 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
       reason = "stream_mismatch";
     } else if (!is_fusable(a.primitive())) {
       reason = "unsupported_primitive";
+    } else if (depth == 0 && is_broadcast(a.primitive())) {
+      // A broadcast root can materialize a larger contiguous output.
+      reason = "broadcast_output_materialization";
     } else if (graph.is_output(a)) {
       auto same_shape = context.same_shape(a, root);
       if (same_shape != ShapeCheck::True) {
@@ -231,7 +246,10 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
       }
     }
     if (!reason.empty()) {
-      context.log_fusion(a, reason);
+      context.log.write(CompileLogCategory::Fusion, [&] {
+        return fmt::format(
+            "rule=pointwise_region node={} reason={}", a.id(), reason);
+      });
       input_set.insert(a.id());
       return;
     }
@@ -255,7 +273,12 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
         auto copy = graph.split_uses(a, cache);
         recurse(copy, depth, s);
       } else {
-        context.log_fusion(a, "external_consumer");
+        context.log.write(CompileLogCategory::Fusion, [&] {
+          return fmt::format(
+              "rule=pointwise_region node={} reason={}",
+              a.id(),
+              "external_consumer");
+        });
         input_set.insert(a.id());
       }
       return;
@@ -268,7 +291,10 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
       input_set.erase(a.id());
     }
     if (input_set.size() >= max_compile_arrays) {
-      context.log_fusion(a, "array_limit");
+      context.log.write(CompileLogCategory::Fusion, [&] {
+        return fmt::format(
+            "rule=pointwise_region node={} reason={}", a.id(), "array_limit");
+      });
       return;
     }
     cache.insert({a.id()});
@@ -278,8 +304,7 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
     }
   };
 
-  // A broadcast root would force a contiguous output and can increase memory.
-  if (root.has_primitive() && !is_broadcast(root.primitive())) {
+  if (root.has_primitive()) {
     Stream s = root.primitive().stream();
     recurse(root, 0, s);
   }
@@ -351,11 +376,23 @@ void fuse_subgraph(
           inputs,
           old_outputs,
           std::move(fused_tape),
-          std::move(constant_ids)),
+          std::move(constant_ids),
+          context.log.compilation_id),
       inputs);
 
   graph.replace_outputs(old_outputs, compiled_outputs);
-  context.log_fusion(root, "accepted");
+  if (context.log.enabled(CompileLogCategory::Passes)) {
+    for (size_t i = 0; i < old_outputs.size(); ++i) {
+      context.log_rewrite(
+          "pointwise_region", old_outputs[i], compiled_outputs[i]);
+    }
+  }
+  context.log.write(CompileLogCategory::Fusion, [&] {
+    return fmt::format(
+        "rule=pointwise_region node={} reason=accepted primitive={}",
+        root.id(),
+        compiled_outputs.back().primitive_id());
+  });
 }
 
 void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
@@ -373,8 +410,13 @@ void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
     }
     auto nodes = collect_fusable_nodes(graph, context, root);
     if (nodes.size() <= 1) {
-      if (root.has_primitive() && is_fusable(root.primitive())) {
-        context.log_fusion(root, "single_primitive");
+      if (nodes.size() == 1) {
+        context.log.write(CompileLogCategory::Fusion, [&] {
+          return fmt::format(
+              "rule=pointwise_region node={} reason={}",
+              root.id(),
+              "single_primitive");
+        });
       }
       continue;
     }
@@ -382,9 +424,12 @@ void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
   }
 }
 
+} // namespace
+
 void run_compile_passes(
     CompileGraph& graph,
     const CompileContext& context,
+    std::string_view stage,
     std::span<const PassSpec> passes) {
   InTracing tracing(context.shapeless);
   std::optional<InExportTracing> export_tracing;
@@ -397,7 +442,8 @@ void run_compile_passes(
       continue;
     }
     auto scoped_context = context;
-    scoped_context.pass_name = pass.name;
+    scoped_context.log.stage = stage;
+    scoped_context.log.pass = pass.name;
     auto before = graph.rewrite_count();
     auto nodes_before = graph.tape().size();
     pass.run(graph, scoped_context);
@@ -406,24 +452,19 @@ void run_compile_passes(
 #else
     graph.rebuild();
 #endif
-    if (context.log_passes) {
-      fmt::print(
-          stderr,
-          "[compile:{}] [passes] pass={} target={} rewrites={} nodes={}->{}\n",
-          context.compilation_id,
-          pass.name,
+    scoped_context.log.write(CompileLogCategory::Passes, [&] {
+      return fmt::format(
+          "event=complete target={} rewrites={} nodes={}->{}",
           context.target == CompileTarget::Compile ? "compile" : "export",
           graph.rewrite_count() - before,
           nodes_before,
           graph.tape().size());
-    }
+    });
   }
 }
 
-} // namespace
-
 void compile_optimize(CompileGraph& graph, const CompileContext& context) {
-  static constexpr PassSpec simplify_passes[] = {
+  static constexpr PassSpec canonicalize_passes[] = {
       {"deduplicate_scalars", deduplicate_scalars, PassScope::CompileAndExport},
       {"remove_noops", remove_noops, PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
@@ -435,10 +476,10 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
   };
   if (context.target == CompileTarget::Export ||
       context.mode != CompileMode::no_simplify) {
-    run_compile_passes(graph, context, simplify_passes);
+    run_compile_passes(graph, context, "canonicalize", canonicalize_passes);
   }
   if (context.mode != CompileMode::no_fuse) {
-    run_compile_passes(graph, context, fusion_passes);
+    run_compile_passes(graph, context, "fusion", fusion_passes);
   }
 }
 

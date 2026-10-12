@@ -8,6 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <fmt/ostream.h>
+#include <fmt/ranges.h>
+
 #include "mlx/allocator.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/compile.h"
@@ -30,7 +33,8 @@ Compiled::Compiled(
     std::vector<array> inputs,
     std::vector<array> outputs,
     std::vector<array> tape,
-    std::unordered_set<uintptr_t> constant_ids)
+    std::unordered_set<uintptr_t> constant_ids,
+    uint64_t compilation_id)
     : Primitive(stream),
       inputs_(std::move(inputs)),
       outputs_(std::move(outputs)),
@@ -38,7 +42,8 @@ Compiled::Compiled(
       constant_ids_(std::move(constant_ids)),
       is_constant_([this](size_t i) {
         return constant_ids_.find(inputs_[i].id()) != constant_ids_.end();
-      }) {
+      }),
+      compilation_id_(compilation_id) {
   // Build the kernel name.
   NodeNamer namer;
   std::ostringstream os;
@@ -189,6 +194,7 @@ class CompileCache {
     CacheEntry(std::optional<Stream> stream, bool shapeless)
         : stream(stream), shapeless(shapeless) {}
     std::optional<Stream> stream;
+    uint64_t compilation_id{next_compilation_id()};
     bool shapeless;
     std::vector<array> inputs;
     std::vector<array> outputs;
@@ -210,7 +216,8 @@ class CompileCache {
       std::uintptr_t fun_id,
       const std::vector<array>& inputs,
       bool shapeless,
-      const std::vector<uint64_t>& constants) {
+      const std::vector<uint64_t>& constants,
+      const CompileLog& log) {
     // Find the cache entries for |fun_id| in a thread-safe way.
     auto entries_ptr = [&]() {
       // Lookup with shared lock.
@@ -231,47 +238,115 @@ class CompileCache {
     }();
     auto& entries = *entries_ptr;
 
-    // Compare if 2 arrays have same shape and dtype.
-    auto has_same_shape_and_dtype = [shapeless](
-                                        const std::vector<array>& in1,
-                                        const std::vector<array>& in2) {
-      if (in1.size() != in2.size()) {
-        return false;
-      }
-      for (size_t i = 0; i < in1.size(); ++i) {
-        if (in1[i].ndim() != in2[i].ndim()) {
-          return false;
-        }
-        if (!shapeless && in1[i].shape() != in2[i].shape()) {
-          return false;
-        }
-        if (in1[i].dtype() != in2[i].dtype()) {
-          return false;
-        }
-      }
-      return true;
-    };
-    // Loop over entries and check:
-    // - Default stream and device match the entry's default stream
-    // - Inputs match i.e. shapes and types must be equal.
     auto stream = peek_default_stream(default_device());
     for (CacheEntry& entry : entries) {
-      // Check that the default stream and device match
-      if (entry.stream != stream) {
+      auto entry_log = log;
+      entry_log.compilation_id = entry.compilation_id;
+      auto check = [&](bool matches,
+                       std::string_view condition,
+                       auto&& expected,
+                       auto&& actual,
+                       int input = -1) {
+        if (!matches) {
+          entry_log.write(CompileLogCategory::Recompiles, [&] {
+            return fmt::format(
+                "event=reject function={} condition={} input={}",
+                fun_id,
+                condition,
+                input);
+          });
+          entry_log.write(CompileLogCategory::Guards, [&] {
+            return fmt::format(
+                "check_stage=call check={} input={} result=False expected={} actual={}",
+                condition,
+                input,
+                std::forward<decltype(expected)>(expected),
+                std::forward<decltype(actual)>(actual));
+          });
+        }
+        return matches;
+      };
+      auto stream_key = [](const std::optional<Stream>& s) {
+        return s
+            ? std::tuple(
+                  static_cast<int>(s->device.type), s->device.index, s->index)
+            : std::tuple(-1, -1, -1);
+      };
+      if (!check(
+              entry.stream == stream,
+              "stream_device",
+              stream_key(entry.stream),
+              stream_key(stream)) ||
+          !check(
+              entry.shapeless == shapeless,
+              "shapeless",
+              entry.shapeless,
+              shapeless) ||
+          !check(
+              entry.inputs.size() == inputs.size(),
+              "arity",
+              entry.inputs.size(),
+              inputs.size())) {
         continue;
       }
-      if (entry.shapeless != shapeless) {
+      bool matches = true;
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto& expected = entry.inputs[i];
+        const auto& actual = inputs[i];
+        if (!check(
+                expected.ndim() == actual.ndim(),
+                "rank",
+                expected.ndim(),
+                actual.ndim(),
+                i) ||
+            (!shapeless &&
+             !check(
+                 expected.shape() == actual.shape(),
+                 "shape",
+                 fmt::join(expected.shape(), ","),
+                 fmt::join(actual.shape(), ","),
+                 i)) ||
+            !check(
+                expected.dtype() == actual.dtype(),
+                "dtype",
+                fmt::streamed(expected.dtype()),
+                fmt::streamed(actual.dtype()),
+                i)) {
+          matches = false;
+          break;
+        }
+      }
+      if (!matches ||
+          !check(
+              entry.constants == constants,
+              "constants",
+              fmt::join(entry.constants, ","),
+              fmt::join(constants, ","))) {
         continue;
       }
-
-      // Check the inputs match and return if so
-      if (has_same_shape_and_dtype(inputs, entry.inputs) &&
-          constants == entry.constants) {
-        return {entry, std::move(entries_ptr)};
-      }
+      entry_log.write(CompileLogCategory::Recompiles, [&] {
+        return fmt::format(
+            "event={} function={} reason={}",
+            entry.empty ? "retry" : "hit",
+            fun_id,
+            entry.empty ? "empty_entry" : "signature_match");
+      });
+      entry_log.write(CompileLogCategory::Guards, [&] {
+        return fmt::format(
+            "check_stage=call check=cache_signature result=True contract={}",
+            shapeless ? "shapeless" : "static");
+      });
+      return {entry, std::move(entries_ptr)};
     }
-    // Otherwise append a new cache entry
     entries.push_back(CacheEntry{stream, shapeless});
+    auto entry_log = log;
+    entry_log.compilation_id = entries.back().compilation_id;
+    entry_log.write(CompileLogCategory::Recompiles, [&] {
+      return fmt::format(
+          "event=miss function={} reason={}",
+          fun_id,
+          entries.size() == 1 ? "cold" : "no_matching_entry");
+    });
     return {entries.back(), std::move(entries_ptr)};
   }
 
@@ -418,8 +493,11 @@ ArrayFnWithExtra compile(
     }
 
     // Find a cache entry with the correct inputs
+    CompileLog log;
+    log.stage = "cache";
     auto [entry, entries_ptr] =
-        compile_cache_unsafe()->find(fun_id, inputs, shapeless, constants);
+        compile_cache_unsafe()->find(fun_id, inputs, shapeless, constants, log);
+    log.compilation_id = entry.compilation_id;
     static_assert(std::is_reference_v<decltype(entry)>);
 
     // No matching cache entry existed, so compile
@@ -433,7 +511,8 @@ ArrayFnWithExtra compile(
       CompileGraph graph(entry.inputs, entry.outputs, inputs);
       compile_optimize(
           graph,
-          CompileContext(shapeless, CompileTarget::Compile, compile_mode()));
+          CompileContext(
+              shapeless, CompileTarget::Compile, compile_mode(), log));
       entry.outputs = graph.outputs();
       entry.tape = graph.tape();
 

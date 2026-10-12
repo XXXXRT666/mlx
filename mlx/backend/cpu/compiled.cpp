@@ -9,10 +9,12 @@
 #include <shared_mutex>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/jit_compiler.h"
+#include "mlx/compile_logging.h"
 #include "mlx/device.h"
 #include "mlx/graph_utils.h"
 #include "mlx/version.h"
@@ -61,11 +63,19 @@ bool compile_available_for_device(const Device& device) {
 // Return a pointer to a compiled function
 void* compile(
     const std::string& kernel_name,
-    const std::function<std::string(void)>& source_builder) {
+    const std::function<std::string(void)>& source_builder,
+    const detail::CompileLog& log,
+    uintptr_t primitive_id) {
   {
     std::shared_lock lock(cache().mtx);
     if (auto it = cache().kernels.find(kernel_name);
         it != cache().kernels.end()) {
+      log.write(detail::CompileLogCategory::Codegen, [&] {
+        return fmt::format(
+            "backend=cpu event=kernel_cache_hit primitive={} kernel={}",
+            primitive_id,
+            kernel_name);
+      });
       return it->second;
     }
   }
@@ -76,6 +86,13 @@ void* compile(
     return it->second;
   }
   std::string source_code = source_builder();
+  log.write(detail::CompileLogCategory::Codegen, [&] {
+    return fmt::format(
+        "backend=cpu event=source primitive={} kernel={}\n{}",
+        primitive_id,
+        kernel_name,
+        source_code);
+  });
   std::string kernel_file_name;
 
   // Deal with long kernel names. Maximum length for filename on macOS is 255
@@ -157,6 +174,14 @@ void* compile(
   }
 
   // load library
+  log.write(detail::CompileLogCategory::Codegen, [&] {
+    return fmt::format(
+        "backend=cpu event=load primitive={} kernel={} source={} library={}",
+        primitive_id,
+        kernel_name,
+        lib_exists ? "disk_cache" : "jit",
+        shared_lib_path);
+  });
   cache().libs.emplace_back(shared_lib_path);
 
   // Load function
@@ -314,11 +339,22 @@ void Compiled::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   auto& encoder = cpu::get_command_encoder(stream());
+  detail::CompileLog log(compilation_id_);
+  log.stage = "backend";
+  auto primitive_id = reinterpret_cast<uintptr_t>(this);
 
   // Collapse contiguous dims to route to a faster kernel if possible. Also
   // handle all broadcasting.
   auto [contiguous, negative_strides, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
+  log.write(detail::CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=backend check=layout primitive={} contiguous={} negative_strides={} shape=[{}]",
+        primitive_id,
+        contiguous,
+        negative_strides,
+        fmt::join(shape, ","));
+  });
 
   // Collect function input arguments.
   std::vector<void*> args;
@@ -339,37 +375,41 @@ void Compiled::eval_cpu(
   }
 
   // Get the function
-  auto fn_ptr = compile(kernel_name, [&, contiguous = contiguous]() {
-    std::ostringstream kernel;
-    kernel << std::get<2>(JitCompiler::get_preamble()) << std::endl;
-    // The prebuilt preamble is produced by running the preprocessor over
-    // compiled_preamble.h, which consumes the NAN / INFINITY macro definitions
-    // (macros vanish during preprocessing). print_float_constant emits those
-    // macros for non-finite constants, so define them here when missing. The
-    // #ifndef guards avoid clashing when <cmath> is already in scope (e.g. the
-    // include-based preamble path).
-    kernel << "#ifndef INFINITY\n"
-              "#define INFINITY (std::numeric_limits<float>::infinity())\n"
-              "#endif\n";
-    kernel << "#ifndef NAN\n"
-              "#define NAN (std::numeric_limits<float>::quiet_NaN())\n"
-              "#endif\n";
-    kernel << "using namespace mlx::core;" << std::endl;
-    kernel << "using namespace mlx::core::detail;" << std::endl;
-    kernel << "extern \"C\"  {" << std::endl;
-    build_kernel(
-        kernel,
-        kernel_name,
-        inputs_,
-        outputs_,
-        tape_,
-        is_constant_,
-        contiguous,
-        ndim);
-    // Close extern "C"
-    kernel << "}" << std::endl;
-    return kernel.str();
-  });
+  auto fn_ptr = compile(
+      kernel_name,
+      [&, contiguous = contiguous]() {
+        std::ostringstream kernel;
+        kernel << std::get<2>(JitCompiler::get_preamble()) << std::endl;
+        // The prebuilt preamble is produced by running the preprocessor over
+        // compiled_preamble.h, which consumes the NAN / INFINITY macro
+        // definitions (macros vanish during preprocessing).
+        // print_float_constant emits those macros for non-finite constants, so
+        // define them here when missing. The #ifndef guards avoid clashing when
+        // <cmath> is already in scope (e.g. the include-based preamble path).
+        kernel << "#ifndef INFINITY\n"
+                  "#define INFINITY (std::numeric_limits<float>::infinity())\n"
+                  "#endif\n";
+        kernel << "#ifndef NAN\n"
+                  "#define NAN (std::numeric_limits<float>::quiet_NaN())\n"
+                  "#endif\n";
+        kernel << "using namespace mlx::core;" << std::endl;
+        kernel << "using namespace mlx::core::detail;" << std::endl;
+        kernel << "extern \"C\"  {" << std::endl;
+        build_kernel(
+            kernel,
+            kernel_name,
+            inputs_,
+            outputs_,
+            tape_,
+            is_constant_,
+            contiguous,
+            ndim);
+        // Close extern "C"
+        kernel << "}" << std::endl;
+        return kernel.str();
+      },
+      log,
+      primitive_id);
 
   compiled_allocate_outputs(inputs, outputs, is_constant_, contiguous);
 
@@ -381,6 +421,15 @@ void Compiled::eval_cpu(
     args.push_back((void*)outputs[0].data_size());
   }
   auto fun = reinterpret_cast<void (*)(int*, int64_t**, void**)>(fn_ptr);
+  log.write(detail::CompileLogCategory::Codegen, [&] {
+    return fmt::format(
+        "backend=cpu event=dispatch primitive={} kernel={} path={} ndim={} elements={}",
+        primitive_id,
+        kernel_name,
+        contiguous ? "contiguous" : "strided",
+        ndim,
+        outputs[0].data_size());
+  });
   encoder.dispatch([fun,
                     args = std::move(args),
                     strides = std::move(strides),

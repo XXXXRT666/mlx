@@ -2,13 +2,14 @@
 
 #pragma once
 
-#include <string_view>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "mlx/api.h"
 #include "mlx/array.h"
 #include "mlx/compile.h"
+#include "mlx/compile_logging.h"
 
 namespace mlx::core::detail {
 
@@ -107,19 +108,23 @@ enum class CompileTarget { Compile, Export };
 enum class ShapeCheck { True, False, Unknown };
 
 struct CompileContext {
-  CompileContext(bool shapeless, CompileTarget target, CompileMode mode);
+  CompileContext(
+      bool shapeless,
+      CompileTarget target,
+      CompileMode mode,
+      CompileLog log = CompileLog{});
 
   ShapeCheck same_shape(const array& a, const array& b) const;
   ShapeCheck dimension_is(const array& a, int axis, int size) const;
-  void log_fusion(const array& a, std::string_view reason) const;
+  void log_rewrite(
+      std::string_view rule,
+      const array& old_output,
+      const array& new_output) const;
 
   bool shapeless;
   CompileTarget target;
   CompileMode mode;
-  bool log_passes{false};
-  bool log_fusions{false};
-  uint64_t compilation_id{0};
-  std::string_view pass_name;
+  CompileLog log;
 };
 
 using PassFn = void (*)(CompileGraph&, const CompileContext&);
@@ -130,6 +135,12 @@ struct PassSpec {
   PassFn run;
   PassScope scope;
 };
+
+void run_compile_passes(
+    CompileGraph& graph,
+    const CompileContext& context,
+    std::string_view stage,
+    std::span<const PassSpec> passes);
 
 void compile_optimize(CompileGraph& graph, const CompileContext& context);
 

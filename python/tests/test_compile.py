@@ -18,13 +18,26 @@ import numpy as np
 
 
 class TestCompile(mlx_tests.MLXTestCase):
-    def test_compile_logs(self):
-        code = """
+    def run_compile_log_test(self, code, categories):
+        setup = """
 import os
+import sys
 import mlx.core as mx
 if "DEVICE" in os.environ:
     mx.set_default_device(getattr(mx, os.environ["DEVICE"]))
 mx.default_stream(mx.default_device())
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", setup + code],
+            env={**os.environ, "MLX_COMPILE_LOGS": categories},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stderr
+
+    def test_compile_logs(self):
+        code = """
 traces = []
 def fun(x):
     traces.append(1)
@@ -32,50 +45,191 @@ def fun(x):
 x = mx.array([-1.0, 2.0])
 compiled = mx.compile(fun)
 first = compiled(x)
-os.environ["MLX_COMPILE_LOGS"] = "passes,fusion"
-second = compiled(x)
+second = compiled(x[::-1])
 assert len(traces) == 1
 mx.export_function(lambda node: None, fun, x)
-assert mx.array_equal(first, second).item()
+print("before_eval", file=sys.stderr)
+mx.eval(first, second)
+assert mx.array_equal(first[::-1], second).item()
 """
-        for categories in ("", "passes", "fusion", "passes,fusion"):
-            with self.subTest(categories=categories):
-                result = subprocess.run(
-                    [sys.executable, "-c", code],
-                    env={**os.environ, "MLX_COMPILE_LOGS": categories},
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                compile_logs = [
-                    line
-                    for line in result.stderr.splitlines()
-                    if "target=export" not in line
+        categories = ("passes", "fusion", "guards", "recompiles", "codegen")
+        for enabled in (
+            "",
+            *categories,
+            ",".join(categories),
+            "notpasses,codegen_extra",
+        ):
+            with self.subTest(categories=enabled):
+                stderr = self.run_compile_log_test(code, enabled)
+                logs = [
+                    line for line in stderr.splitlines() if line.startswith("[compile:")
                 ]
-                passes = [line for line in compile_logs if "[passes]" in line]
-                fusion = [line for line in compile_logs if "[fusion]" in line]
-                pass_names = (
-                    "deduplicate_scalars",
-                    "remove_noops",
-                    "eliminate_common_subexpressions",
-                    "fuse_pointwise",
-                )
-                self.assertEqual(len(passes), 4 if "passes" in categories else 0)
-                self.assertEqual(bool(fusion), "fusion" in categories)
-                if passes:
-                    for name, line in zip(pass_names, passes):
-                        self.assertIn(f"pass={name} ", line)
+                for category in categories:
+                    self.assertEqual(
+                        any(f"[{category}]" in line for line in logs),
+                        category in enabled.split(","),
+                    )
+                passes = [
+                    line for line in logs if "event=complete target=compile" in line
+                ]
+                export = [
+                    line for line in logs if "event=complete target=export" in line
+                ]
+                if "passes" in enabled.split(","):
+                    pass_names = (
+                        "deduplicate_scalars",
+                        "remove_noops",
+                        "eliminate_common_subexpressions",
+                        "fuse_pointwise",
+                    )
+                    self.assertEqual(len(passes), 4)
+                    self.assertEqual(len(export), 3)
+                    for lines in (passes, export):
+                        for name, line in zip(pass_names, lines):
+                            self.assertIn(f"pass={name} ", line)
+                    self.assertIn("stage=canonicalize", passes[0])
+                    self.assertIn("stage=fusion", passes[-1])
                     self.assertIn("rewrites=1", passes[-1])
-                if fusion:
-                    self.assertTrue(any("reason=accepted" in line for line in fusion))
-                export_logs = [
-                    line
-                    for line in result.stderr.splitlines()
-                    if "target=export" in line
-                ]
-                self.assertEqual(len(export_logs), 3)
-                for name, line in zip(pass_names, export_logs):
-                    self.assertIn(f"pass={name} ", line)
+                    self.assertTrue(
+                        any(
+                            "event=rewrite rule=pointwise_region" in line
+                            for line in logs
+                        )
+                    )
+                if "codegen" in enabled.split(","):
+                    before, after = stderr.split("before_eval\n")
+                    self.assertNotIn("[codegen]", before)
+                    self.assertIn("event=source", after)
+                    self.assertIn("event=dispatch", after)
+                    dispatches = [line for line in logs if "event=dispatch" in line]
+                    self.assertTrue(any("_contiguous" in line for line in dispatches))
+                    self.assertTrue(any("_strided" in line for line in dispatches))
+                    if "fusion" in enabled.split(","):
+                        accepted = next(
+                            line for line in logs if "reason=accepted" in line
+                        )
+                        dispatches = [line for line in logs if "event=dispatch" in line]
+                        compile_id = accepted.split()[0]
+                        primitive = next(
+                            part
+                            for part in accepted.split()
+                            if part.startswith("primitive=")
+                        )
+                        self.assertTrue(
+                            all(
+                                compile_id in line and primitive in line
+                                for line in dispatches
+                            )
+                        )
+                if "guards" in enabled.split(","):
+                    self.assertIn("check_stage=compile check=same_shape", stderr)
+                    self.assertIn("check_stage=call check=cache_signature", stderr)
+                    self.assertIn("check_stage=backend check=layout", stderr)
+
+    def test_compile_fusion_skip_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+def fun(x):
+    return mx.broadcast_to(mx.exp(mx.abs(x)), (2, 3))
+x = mx.array([[-1.0, 2.0, 3.0]])
+output = mx.compile(fun)(x)
+assert mx.allclose(output, fun(x)).item()
+""",
+            "fusion",
+        )
+        self.assertIn("reason=broadcast_output_materialization", stderr)
+        self.assertIn("reason=accepted", stderr)
+        self.assertNotIn("reason=single_primitive", stderr)
+
+        stderr = self.run_compile_log_test(
+            "mx.compile(mx.exp)(mx.array([-1.0, 2.0, 3.0]))", "fusion"
+        )
+        self.assertIn("reason=single_primitive", stderr)
+        self.assertNotIn("reason=broadcast_output_materialization", stderr)
+
+    def test_compile_logs_enable_after_compile(self):
+        stderr = self.run_compile_log_test(
+            """
+traces = []
+def fun(x):
+    traces.append(1)
+    return mx.exp(mx.abs(x))
+x = mx.array([-1.0, 2.0])
+compiled = mx.compile(fun)
+first = compiled(x)
+os.environ["MLX_COMPILE_LOGS"] = "passes,fusion,guards,recompiles,codegen"
+second = compiled(x)
+mx.eval(first, second)
+assert len(traces) == 1
+os.environ["MLX_COMPILE_LOGS"] = ""
+print("disabled", file=sys.stderr)
+mx.eval(compiled(x))
+assert len(traces) == 1
+""",
+            "",
+        )
+        self.assertNotIn("[passes]", stderr)
+        self.assertNotIn("[fusion]", stderr)
+        self.assertNotIn("event=miss", stderr)
+        self.assertIn("event=hit", stderr)
+        self.assertIn("event=dispatch", stderr)
+        self.assertNotIn("[compile:", stderr.split("disabled\n")[1])
+
+    def test_compile_cache_miss_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+def fun(*xs):
+    return mx.exp(mx.abs(xs[0]))
+x = mx.array([-1.0, 2.0])
+compiled = mx.compile(fun)
+compiled(x)
+compiled(x)
+compiled(mx.array([1.0, 2.0, 3.0]))
+compiled(mx.ones((1, 2)))
+compiled(mx.array([1, 2], dtype=mx.int32))
+compiled(x, x)
+compiled(x, 1)
+compiled(x, 2)
+mx.set_default_stream(mx.new_stream(mx.default_device()))
+compiled(x)
+""",
+            "guards,recompiles",
+        )
+        self.assertIn("event=miss", stderr)
+        self.assertIn("event=hit", stderr)
+        for condition in (
+            "shape",
+            "rank",
+            "dtype",
+            "arity",
+            "constants",
+            "stream_device",
+        ):
+            self.assertIn(f"condition={condition} ", stderr)
+            self.assertIn(f"check={condition} ", stderr)
+        self.assertIn("result=False expected=2 actual=3", stderr)
+        self.assertIn("result=False expected=float32 actual=int32", stderr)
+
+    def test_shapeless_guard_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+traces = []
+def fun(x, y):
+    traces.append(1)
+    a = mx.abs(x)
+    return a, a + y
+compiled = mx.compile(fun, shapeless=True)
+compiled(mx.ones((2,)), mx.ones((2,)))
+outputs = compiled(mx.ones((1,)), mx.ones((3,)))
+assert len(traces) == 1
+assert outputs[0].shape == (1,) and outputs[1].shape == (3,)
+""",
+            "guards,recompiles",
+        )
+        self.assertIn("check=same_shape", stderr)
+        self.assertIn("contract=shapeless result=Unknown", stderr)
+        self.assertIn("event=hit", stderr)
+        self.assertNotIn("condition=shape ", stderr)
 
     def test_simple_compile(self):
         def fun(x, y):

@@ -522,13 +522,25 @@ Set ``MLX_COMPILE_LOGS`` to enable compiler diagnostics on standard error:
 
 .. code-block:: shell
 
-  MLX_COMPILE_LOGS=passes,fusion python example.py
+  MLX_COMPILE_LOGS=fusion,guards,recompiles python example.py
 
-``passes`` reports the compilation ID, pass name, target, rewrite count, and
-node counts before and after each pass. ``fusion`` reports accepted pointwise
-regions and the conditions that stop candidate traversal. These are compiler
-decisions, not records of kernel execution. The categories can be enabled
-separately with ``MLX_COMPILE_LOGS=passes`` or ``MLX_COMPILE_LOGS=fusion``.
+Select any combination of these five categories, separated by commas:
+
+* ``passes`` reports stages, pass names, rule replacements, rewrite counts,
+  and node counts before and after each pass.
+* ``fusion`` reports accepted pointwise regions and the conditions that stop
+  candidate traversal, including shape proofs, consumers, and size limits.
+* ``guards`` reports shape-query results and failed cache-signature checks,
+  with the expected and observed metadata, plus runtime layout checks.
+* ``recompiles`` reports graph cache hits, misses, retries, and the first
+  failed condition for each rejected entry.
+* ``codegen`` reports source produced for ``Compiled`` regions and the kernel
+  selected at backend dispatch. Source appears only when the backend builds
+  it; a cached kernel can dispatch without a new source log.
+
+Compilation IDs link cache and pass events. Primitive IDs link fusion
+replacements to backend code generation and dispatch. Dispatch logs record
+work submission, not kernel completion, and do not add synchronization.
 
 Shape checks use the compilation's static or shapeless contract. In shapeless
 mode, equal sample dimensions do not prove equal output shapes on later calls.
@@ -540,4 +552,9 @@ Compilation and export run ``deduplicate_scalars``, ``remove_noops``, and
 ``fuse_pointwise``. Export does not run pointwise fusion.
 
 Logs are disabled by default. Enabling logs does not evaluate arrays or clear
-compiled function caches, so a cache hit does not produce pass logs.
+compiled function caches. A cache hit does not produce pass logs, but can
+produce ``recompiles``, ``guards``, and backend ``codegen`` logs. Categories
+are read at call entry and backend evaluation, so they can be changed after
+a function is compiled.
+
+For pass development, see :ref:`compile_passes`.

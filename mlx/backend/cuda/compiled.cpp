@@ -4,10 +4,12 @@
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/jit_module.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
+#include "mlx/compile_logging.h"
 #include "mlx/graph_utils.h"
 #include "mlx/primitives.h"
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <nvtx3/nvtx3.hpp>
 
 namespace mlx::core {
@@ -227,6 +229,9 @@ void Compiled::eval_gpu(
     std::vector<array>& outputs) {
   nvtx3::scoped_range r("Compiled::eval_gpu");
   auto& s = stream();
+  detail::CompileLog log(compilation_id_);
+  log.stage = "backend";
+  auto primitive_id = reinterpret_cast<uintptr_t>(this);
 
   // Determine the work per thread for the vectorized reads/writes. We take it
   // as 16 over the max itemsize for the outputs. Another heuristic could be
@@ -279,6 +284,13 @@ void Compiled::eval_gpu(
       }
     }
 
+    log.write(detail::CompileLogCategory::Codegen, [&] {
+      return fmt::format(
+          "backend=cuda event=source primitive={} library={}\n{}",
+          primitive_id,
+          kernel_lib_,
+          builder.os);
+    });
     return std::make_tuple(
         false, std::move(builder.os), std::move(kernel_names));
   });
@@ -291,6 +303,15 @@ void Compiled::eval_gpu(
   // Whether to use large index (also true for negative strides).
   bool large =
       negative_strides || compiled_use_large_index(inputs, outputs, contiguous);
+  log.write(detail::CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=backend check=layout primitive={} contiguous={} negative_strides={} large_index={} shape=[{}]",
+        primitive_id,
+        contiguous,
+        negative_strides,
+        large,
+        fmt::join(shape, ","));
+  });
 
   cu::KernelArgs args;
   // Put inputs.
@@ -350,6 +371,16 @@ void Compiled::eval_gpu(
   auto [kernel, max_block_dims] = mod.get_kernel_and_dims(kernel_name);
   auto [num_blocks, block_dims] =
       get_launch_args(outputs[0], large, work_per_thread, max_block_dims);
+  log.write(detail::CompileLogCategory::Codegen, [&] {
+    return fmt::format(
+        "backend=cuda event=dispatch primitive={} kernel={} grid={}x{}x{} block={}",
+        primitive_id,
+        kernel_name,
+        num_blocks.x,
+        num_blocks.y,
+        num_blocks.z,
+        block_dims);
+  });
   encoder.add_kernel_node_raw(
       kernel, num_blocks, block_dims, {}, 0, args.args());
 }

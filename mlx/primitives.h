@@ -642,7 +642,8 @@ class MLX_API Compiled : public Primitive {
       std::vector<array> inputs,
       std::vector<array> outputs,
       std::vector<array> tape,
-      std::unordered_set<uintptr_t> constant_ids);
+      std::unordered_set<uintptr_t> constant_ids,
+      uint64_t compilation_id);
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -665,6 +666,7 @@ class MLX_API Compiled : public Primitive {
   const std::vector<array> tape_;
   const std::unordered_set<uintptr_t> constant_ids_;
   const std::function<bool(size_t)> is_constant_;
+  const uint64_t compilation_id_;
 
   mutable std::string name_;
   std::string kernel_lib_;

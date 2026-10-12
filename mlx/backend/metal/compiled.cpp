@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -7,6 +8,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/compile_logging.h"
 #include "mlx/graph_utils.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
@@ -257,6 +259,9 @@ inline void build_kernel(
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  detail::CompileLog log(compilation_id_);
+  log.stage = "backend";
+  auto primitive_id = reinterpret_cast<uintptr_t>(this);
   // Get the kernel if someone else built it already
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -355,6 +360,13 @@ void Compiled::eval_gpu(
         /* dynamic_dims = */ true,
         /* use_big_index = */ true,
         /* work_per_thread = */ 4);
+    log.write(detail::CompileLogCategory::Codegen, [&] {
+      return fmt::format(
+          "backend=metal event=source primitive={} library={}\n{}",
+          primitive_id,
+          kernel_lib_,
+          kernel);
+    });
     return kernel;
   });
 
@@ -389,6 +401,15 @@ void Compiled::eval_gpu(
   if (large) {
     kernel_name += "_large";
   }
+  log.write(detail::CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=backend check=layout primitive={} contiguous={} negative_strides={} large_index={} shape=[{}]",
+        primitive_id,
+        contiguous,
+        negative_strides,
+        large,
+        fmt::join(shape, ","));
+  });
   auto kernel = d.get_kernel(kernel_name, lib);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -440,6 +461,20 @@ void Compiled::eval_gpu(
   }
 
   // Launch the kernel
+  auto log_dispatch = [&](const MTL::Size& grid, const MTL::Size& group) {
+    log.write(detail::CompileLogCategory::Codegen, [&] {
+      return fmt::format(
+          "backend=metal event=dispatch primitive={} kernel={} grid={}x{}x{} group={}x{}x{}",
+          primitive_id,
+          kernel_name,
+          grid.width,
+          grid.height,
+          grid.depth,
+          group.width,
+          group.height,
+          group.depth);
+    });
+  };
   if (contiguous) {
     size_t nthreads = ceildiv(outputs[0].data_size(), work_per_thread);
     MTL::Size group_dims(
@@ -448,6 +483,7 @@ void Compiled::eval_gpu(
         ? get_2d_grid_dims(
               outputs[0].shape(), outputs[0].strides(), work_per_thread)
         : MTL::Size(nthreads, 1, 1);
+    log_dispatch(grid_dims, group_dims);
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   } else {
     size_t dim0 = ndim > 0 ? shape[ndim - 1] : 1;
@@ -465,6 +501,7 @@ void Compiled::eval_gpu(
     }
     auto group_dims = get_block_dims(dim0, dim1, rest, pow2);
     MTL::Size grid_dims = MTL::Size(dim0, dim1, rest);
+    log_dispatch(grid_dims, group_dims);
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 }

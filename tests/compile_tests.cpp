@@ -289,6 +289,52 @@ TEST_CASE("test compile simplification pass order") {
   }
 }
 
+TEST_CASE("test compile runner with a separate pass list") {
+  auto remove_copy = [](detail::CompileGraph& graph,
+                        const detail::CompileContext& context) {
+    CHECK_EQ(context.log.stage, "canonicalize");
+    if (context.log.pass == "compile_only") {
+      CHECK_EQ(context.target, detail::CompileTarget::Compile);
+    } else {
+      CHECK_EQ(context.log.pass, "shared");
+    }
+    auto output = graph.outputs()[0];
+    auto input = output.inputs()[0];
+    graph.replace_outputs({output}, {input});
+    context.log_rewrite("remove_copy", output, input);
+  };
+  const detail::PassSpec passes[] = {
+      {"compile_only", remove_copy, detail::PassScope::CompileOnly},
+      {"shared", remove_copy, detail::PassScope::CompileAndExport}};
+  auto x = array({-1.0f, 2.0f});
+  for (auto target :
+       {detail::CompileTarget::Compile, detail::CompileTarget::Export}) {
+    auto output = copy(copy(x));
+    detail::CompileGraph graph({x}, {output, output}, {});
+    detail::run_compile_passes(
+        graph,
+        detail::CompileContext(false, target, CompileMode::enabled),
+        "canonicalize",
+        passes);
+    CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[1].id());
+    CHECK_EQ(
+        graph.tape().size(), target == detail::CompileTarget::Compile ? 1 : 2);
+    graph.validate();
+    CHECK(array_equal(graph.outputs()[0], x).item<bool>());
+  }
+}
+
+TEST_CASE("test disabled compile logs do not build messages") {
+  detail::CompileLog log;
+  log.categories = 0;
+  bool built = false;
+  log.write(detail::CompileLogCategory::Codegen, [&] {
+    built = true;
+    return "unused";
+  });
+  CHECK_FALSE(built);
+}
+
 std::vector<array> simple_fun(const std::vector<array>& inputs) {
   return std::vector<array>{inputs[0] + inputs[1]};
 }

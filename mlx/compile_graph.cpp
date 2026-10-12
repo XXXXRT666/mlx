@@ -1,12 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
 #include <algorithm>
-#include <atomic>
-#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
-#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "mlx/compile_impl.h"
 #include "mlx/primitives.h"
@@ -427,73 +425,89 @@ void CompileGraph::validate() {
 CompileContext::CompileContext(
     bool shapeless,
     CompileTarget target,
-    CompileMode mode)
-    : shapeless(shapeless), target(target), mode(mode) {
-  if (const char* value = std::getenv("MLX_COMPILE_LOGS")) {
-    std::string_view categories(value);
-    while (!categories.empty()) {
-      auto end = categories.find(',');
-      auto category = categories.substr(0, end);
-      log_passes |= category == "passes";
-      log_fusions |= category == "fusion";
-      if (end == std::string_view::npos) {
-        break;
-      }
-      categories.remove_prefix(end + 1);
-    }
-  }
-  if (log_passes || log_fusions) {
-    static std::atomic<uint64_t> next_id{0};
-    compilation_id = ++next_id;
+    CompileMode mode,
+    CompileLog log)
+    : shapeless(shapeless), target(target), mode(mode), log(log) {
+  if (this->log.compilation_id == 0) {
+    this->log.compilation_id = next_compilation_id();
   }
 }
 
 ShapeCheck CompileContext::same_shape(const array& a, const array& b) const {
-  if (a.ndim() != b.ndim()) {
-    return ShapeCheck::False;
-  }
-  if (a.id() == b.id() || a.ndim() == 0) {
-    return ShapeCheck::True;
-  }
-  if (shapeless) {
-    // Equivalent calls infer the same output shape from the same inputs.
-    if (a.has_primitive() && b.has_primitive() &&
-        a.sibling_position() == b.sibling_position() &&
-        a.inputs().size() == b.inputs().size() &&
-        std::equal(
-            a.inputs().begin(),
-            a.inputs().end(),
-            b.inputs().begin(),
-            [](const auto& x, const auto& y) { return x.id() == y.id(); })) {
-      const auto& pa = a.primitive();
-      const auto& pb = b.primitive();
-      if (typeid(pa) == typeid(pb) && pa.is_equivalent(pb)) {
-        return ShapeCheck::True;
-      }
+  auto result = [&]() {
+    if (a.ndim() != b.ndim()) {
+      return ShapeCheck::False;
     }
-    return ShapeCheck::Unknown;
-  }
-  return a.shape() == b.shape() ? ShapeCheck::True : ShapeCheck::False;
+    if (a.id() == b.id() || a.ndim() == 0) {
+      return ShapeCheck::True;
+    }
+    if (shapeless) {
+      // Equivalent calls infer the same output shape from the same inputs.
+      if (a.has_primitive() && b.has_primitive() &&
+          a.sibling_position() == b.sibling_position() &&
+          a.inputs().size() == b.inputs().size() &&
+          std::equal(
+              a.inputs().begin(),
+              a.inputs().end(),
+              b.inputs().begin(),
+              [](const auto& x, const auto& y) { return x.id() == y.id(); })) {
+        const auto& pa = a.primitive();
+        const auto& pb = b.primitive();
+        if (typeid(pa) == typeid(pb) && pa.is_equivalent(pb)) {
+          return ShapeCheck::True;
+        }
+      }
+      return ShapeCheck::Unknown;
+    }
+    return a.shape() == b.shape() ? ShapeCheck::True : ShapeCheck::False;
+  }();
+  log.write(CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=compile check=same_shape node={} other={} contract={} result={} shapes=[{}],[{}]",
+        a.id(),
+        b.id(),
+        shapeless ? "shapeless" : "static",
+        result == ShapeCheck::True        ? "True"
+            : result == ShapeCheck::False ? "False"
+                                          : "Unknown",
+        fmt::join(a.shape(), ","),
+        fmt::join(b.shape(), ","));
+  });
+  return result;
 }
 
 ShapeCheck CompileContext::dimension_is(const array& a, int axis, int size)
     const {
-  if (shapeless) {
-    return ShapeCheck::Unknown;
-  }
-  return a.shape(axis) == size ? ShapeCheck::True : ShapeCheck::False;
+  auto result = shapeless     ? ShapeCheck::Unknown
+      : a.shape(axis) == size ? ShapeCheck::True
+                              : ShapeCheck::False;
+  log.write(CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=compile check=dimension_is node={} axis={} expected={} shape=[{}] contract={} result={}",
+        a.id(),
+        axis,
+        size,
+        fmt::join(a.shape(), ","),
+        shapeless ? "shapeless" : "static",
+        result == ShapeCheck::True        ? "True"
+            : result == ShapeCheck::False ? "False"
+                                          : "Unknown");
+  });
+  return result;
 }
 
-void CompileContext::log_fusion(const array& a, std::string_view reason) const {
-  if (log_fusions) {
-    fmt::print(
-        stderr,
-        "[compile:{}] [fusion] pass={} node={} reason={}\n",
-        compilation_id,
-        pass_name,
-        a.id(),
-        reason);
-  }
+void CompileContext::log_rewrite(
+    std::string_view rule,
+    const array& old_output,
+    const array& new_output) const {
+  log.write(CompileLogCategory::Passes, [&] {
+    return fmt::format(
+        "event=rewrite rule={} node={} replacement={} primitive={}",
+        rule,
+        old_output.id(),
+        new_output.id(),
+        new_output.primitive_id());
+  });
 }
 
 } // namespace mlx::core::detail
