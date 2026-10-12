@@ -4,6 +4,9 @@ import gc
 import inspect
 import io
 import math
+import os
+import subprocess
+import sys
 import threading
 from functools import partial, wraps
 from io import StringIO
@@ -15,6 +18,65 @@ import numpy as np
 
 
 class TestCompile(mlx_tests.MLXTestCase):
+    def test_compile_logs(self):
+        code = """
+import os
+import mlx.core as mx
+if "DEVICE" in os.environ:
+    mx.set_default_device(getattr(mx, os.environ["DEVICE"]))
+mx.default_stream(mx.default_device())
+traces = []
+def fun(x):
+    traces.append(1)
+    return mx.exp(mx.abs(x))
+x = mx.array([-1.0, 2.0])
+compiled = mx.compile(fun)
+first = compiled(x)
+os.environ["MLX_COMPILE_LOGS"] = "passes,fusion"
+second = compiled(x)
+assert len(traces) == 1
+mx.export_function(lambda node: None, fun, x)
+assert mx.array_equal(first, second).item()
+"""
+        for categories in ("", "passes", "fusion", "passes,fusion"):
+            with self.subTest(categories=categories):
+                result = subprocess.run(
+                    [sys.executable, "-c", code],
+                    env={**os.environ, "MLX_COMPILE_LOGS": categories},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                compile_logs = [
+                    line
+                    for line in result.stderr.splitlines()
+                    if "target=export" not in line
+                ]
+                passes = [line for line in compile_logs if "[passes]" in line]
+                fusion = [line for line in compile_logs if "[fusion]" in line]
+                pass_names = (
+                    "deduplicate_scalars",
+                    "remove_noops",
+                    "eliminate_common_subexpressions",
+                    "fuse_pointwise",
+                )
+                self.assertEqual(len(passes), 4 if "passes" in categories else 0)
+                self.assertEqual(bool(fusion), "fusion" in categories)
+                if passes:
+                    for name, line in zip(pass_names, passes):
+                        self.assertIn(f"pass={name} ", line)
+                    self.assertIn("rewrites=1", passes[-1])
+                if fusion:
+                    self.assertTrue(any("reason=accepted" in line for line in fusion))
+                export_logs = [
+                    line
+                    for line in result.stderr.splitlines()
+                    if "target=export" in line
+                ]
+                self.assertEqual(len(export_logs), 3)
+                for name, line in zip(pass_names, export_logs):
+                    self.assertIn(f"pass={name} ", line)
+
     def test_simple_compile(self):
         def fun(x, y):
             return x + y
@@ -614,6 +676,26 @@ class TestCompile(mlx_tests.MLXTestCase):
         # Dim change recompiles
         x = mx.array([[1, 2, 3]])
         self.assertTrue(mx.array_equal(fun(x), mx.array([[3, 4, 5]])))
+
+    def test_shapeless_compile_output_shape_guards(self):
+        mx.default_stream(mx.default_device())
+        traces = []
+
+        def fun(x, y):
+            traces.append(1)
+            a = mx.abs(x)
+            return a, a + y, a
+
+        compiled = mx.compile(fun, shapeless=True)
+        for xs, ys in (((2,), (2,)), ((1,), (3,)), ((4,), (1,))):
+            x = -mx.arange(1, xs[0] + 1, dtype=mx.float32)[::-1]
+            y = mx.arange(ys[0], dtype=mx.float32)
+            expected = (mx.abs(x), mx.abs(x) + y, mx.abs(x))
+            actual = compiled(x, y)
+            for result, reference in zip(actual, expected):
+                self.assertEqual(result.shape, reference.shape)
+                self.assertTrue(mx.array_equal(result, reference))
+        self.assertEqual(len(traces), 1)
 
     def test_shapeless_compile_with_broadcasts(self):
         x = mx.ones((2, 2))

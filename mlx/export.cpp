@@ -825,11 +825,15 @@ void FunctionExporter::export_function(const Args& args, const Kwargs& kwargs) {
         detail::compile_trace(flat_fun, inputs, ftable->shapeless);
   }
 
-  // DFS the graph and get the tape
-  auto [tape, parents_map] =
-      detail::compile_dfs(trace_inputs, trace_outputs, inputs);
-
-  detail::compile_simplify(tape, parents_map, trace_outputs, /* passes */ 3);
+  detail::CompileGraph graph(trace_inputs, trace_outputs, inputs);
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          ftable->shapeless,
+          detail::CompileTarget::Export,
+          CompileMode::enabled));
+  trace_outputs = graph.outputs();
+  const auto& tape = graph.tape();
 
   // Update the table entry
   fentry.kwarg_keys = kwarg_keys;

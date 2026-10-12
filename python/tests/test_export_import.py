@@ -12,6 +12,30 @@ import mlx_tests
 
 
 class TestExportImport(mlx_tests.MLXTestCase):
+    def test_export_repeated_outputs_after_simplification(self):
+        def fun(x):
+            quotient, remainder = mx.divmod(x, mx.array(3, dtype=x.dtype))
+            y = mx.negative(mx.stop_gradient(quotient))
+            return remainder, y, remainder, mx.array(y), x
+
+        for shapeless in (False, True):
+            with self.subTest(shapeless=shapeless):
+                x = mx.array([4.0, 8.0])
+                path = os.path.join(self.test_dir, "repeated_outputs.mlxfn")
+                mx.export_function(path, fun, x, shapeless=shapeless)
+                imported = mx.import_function(path)
+                compiled = mx.compile(fun, shapeless=shapeless)
+                sizes = (2, 5) if shapeless else (2,)
+                for size in sizes:
+                    x = mx.arange(size, dtype=mx.float32) + 4
+                    expected = fun(x)
+                    for outputs in (imported(x), compiled(x)):
+                        self.assertEqual(len(outputs), len(expected))
+                        for actual, reference in zip(outputs, expected):
+                            self.assertEqual(actual.dtype, reference.dtype)
+                            self.assertEqual(actual.shape, reference.shape)
+                            self.assertTrue(mx.array_equal(actual, reference))
+
     @classmethod
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()

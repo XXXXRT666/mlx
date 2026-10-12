@@ -514,3 +514,30 @@ fix this by using :func:`flatten` to avoid hardcoding the shape of ``x``:
 
   # Ok
   out = compiled_fun(x)
+
+Compilation Logs
+----------------
+
+Set ``MLX_COMPILE_LOGS`` to enable compiler diagnostics on standard error:
+
+.. code-block:: shell
+
+  MLX_COMPILE_LOGS=passes,fusion python example.py
+
+``passes`` reports the compilation ID, pass name, target, rewrite count, and
+node counts before and after each pass. ``fusion`` reports accepted pointwise
+regions and the conditions that stop candidate traversal. These are compiler
+decisions, not records of kernel execution. The categories can be enabled
+separately with ``MLX_COMPILE_LOGS=passes`` or ``MLX_COMPILE_LOGS=fusion``.
+
+Shape checks use the compilation's static or shapeless contract. In shapeless
+mode, equal sample dimensions do not prove equal output shapes on later calls.
+Fusion leaves unproven output shapes separate and reports
+``output_shape_not_proven``.
+
+Compilation and export run ``deduplicate_scalars``, ``remove_noops``, and
+``eliminate_common_subexpressions`` in that order. Compilation then runs
+``fuse_pointwise``. Export does not run pointwise fusion.
+
+Logs are disabled by default. Enabling logs does not evaluate arrays or clear
+compiled function caches, so a cache hit does not produce pass logs.

@@ -8,10 +8,286 @@
 #include <cmath>
 #include <limits>
 
+#include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
 
 using namespace mlx::core;
+
+TEST_CASE("test compile graph isolation and cleanup") {
+  auto x = array({-1.0f, 2.0f});
+  auto inner = copy(x);
+  auto outer = copy(inner);
+  detail::CompileGraph graph({x}, {outer, outer, x}, {});
+  auto root = graph.outputs()[0];
+  auto input = root.inputs()[0];
+  CHECK_NE(root.id(), outer.id());
+  CHECK_NE(input.id(), inner.id());
+
+  graph.replace_outputs({input}, {x});
+  graph.validate();
+  CHECK_EQ(root.inputs()[0].id(), x.id());
+  CHECK_EQ(outer.inputs()[0].id(), inner.id());
+  CHECK_FALSE(graph.contains(input));
+
+  graph.replace_outputs({root}, {x});
+  graph.validate();
+  CHECK_EQ(graph.tape().size(), 1);
+  CHECK_EQ(graph.tape()[0].id(), x.id());
+  for (const auto& out : graph.outputs()) {
+    CHECK_EQ(out.id(), x.id());
+  }
+  CHECK_EQ(graph.rewrite_count(), 2);
+}
+
+TEST_CASE("test compile graph simultaneous outputs") {
+  auto x = array({9.0f, 7.0f});
+  auto y = array({4.0f, 3.0f});
+  auto parts = divmod(x, y);
+  detail::CompileGraph graph(
+      {x, y}, {parts[1], parts[0], parts[1], parts[0] + parts[1]}, {});
+  auto remainder = graph.outputs()[0];
+  auto quotient = graph.outputs()[1];
+  auto sum = graph.outputs()[3];
+  graph.replace_outputs({quotient, remainder}, {remainder, quotient});
+  graph.validate();
+  CHECK_EQ(graph.outputs()[0].id(), quotient.id());
+  CHECK_EQ(graph.outputs()[1].id(), remainder.id());
+  CHECK_EQ(graph.outputs()[2].id(), quotient.id());
+  CHECK_EQ(sum.inputs()[0].id(), remainder.id());
+  CHECK_EQ(sum.inputs()[1].id(), quotient.id());
+
+  graph.replace_outputs({quotient}, {x});
+  graph.validate();
+  CHECK_EQ(graph.outputs()[0].id(), x.id());
+  CHECK_EQ(graph.outputs()[1].id(), remainder.id());
+  CHECK_EQ(sum.inputs()[0].id(), remainder.id());
+  CHECK_EQ(sum.inputs()[1].id(), x.id());
+  CHECK_EQ(remainder.siblings()[0].id(), quotient.id());
+}
+
+TEST_CASE("test compile graph retained dependencies") {
+  auto x = array({-1.0f, 2.0f});
+  auto a = abs(x);
+  auto b = negative(a);
+  detail::CompileGraph graph({x}, {a, b, b}, {});
+  a = graph.outputs()[0];
+  b = graph.outputs()[1];
+  auto replacement = negative(a);
+  graph.replace_outputs({a}, {replacement});
+  graph.validate();
+  CHECK_EQ(replacement.inputs()[0].id(), a.id());
+  CHECK_EQ(b.inputs()[0].id(), replacement.id());
+  CHECK_EQ(graph.outputs()[1].id(), graph.outputs()[2].id());
+  CHECK(array_equal(b, array({1.0f, 2.0f})).item<bool>());
+}
+
+TEST_CASE("test compile graph validation") {
+  auto x = array({-1.0f, 2.0f});
+  detail::CompileGraph graph({x}, {negative(abs(x))}, {});
+  auto root = graph.outputs()[0];
+  auto input = root.inputs()[0];
+  root.inputs()[0] = x;
+  CHECK_THROWS_AS(graph.validate(), std::logic_error);
+  root.inputs()[0] = root;
+  CHECK_THROWS_AS(graph.validate(), std::logic_error);
+  root.inputs()[0] = input;
+  graph.validate();
+}
+
+TEST_CASE("test compile graph preserves fused tape") {
+  auto x = array({-1.0f, 2.0f});
+  auto a = abs(x);
+  auto b = negative(a);
+  detail::CompileGraph graph({x}, {b, a, b}, {});
+  b = graph.outputs()[0];
+  a = graph.outputs()[1];
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          false, detail::CompileTarget::Compile, CompileMode::no_simplify));
+  graph.validate();
+  CHECK_EQ(b.inputs()[0].id(), a.id());
+  CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[2].id());
+  const auto& primitive = graph.outputs()[0].primitive();
+  CHECK_EQ(typeid(primitive), typeid(Compiled));
+  CHECK_EQ(graph.outputs()[0].siblings()[0].id(), graph.outputs()[1].id());
+  CHECK(array_equal(graph.outputs()[0], array({-1.0f, -2.0f})).item<bool>());
+  CHECK(array_equal(graph.outputs()[1], array({1.0f, 2.0f})).item<bool>());
+}
+
+TEST_CASE("test compile graph invalid replacements") {
+  auto x = array({1.0f, 2.0f});
+  detail::CompileGraph graph({x}, {negative(x)}, {});
+  auto a = graph.outputs()[0];
+  CHECK_THROWS_AS(graph.replace_outputs({a}, {}), std::invalid_argument);
+  CHECK_THROWS_AS(
+      graph.replace_outputs({a}, {array(1.0f)}), std::invalid_argument);
+  CHECK_THROWS_AS(
+      graph.replace_outputs({a}, {astype(x, int32)}), std::invalid_argument);
+  CHECK_THROWS_AS(graph.replace_outputs({a, a}, {x, a}), std::invalid_argument);
+  CHECK_EQ(graph.outputs()[0].id(), a.id());
+  CHECK_EQ(graph.rewrite_count(), 0);
+  graph.validate();
+}
+
+TEST_CASE("test compile graph unused replacement region") {
+  auto x = array({-1.0f, 2.0f});
+  detail::CompileGraph graph({x}, {negative(abs(x))}, {});
+  auto b = graph.outputs()[0];
+  auto a = b.inputs()[0];
+  auto unused = negative(a);
+  auto retained = negative(b);
+  graph.replace_outputs({a, b}, {unused, retained});
+  CHECK_FALSE(graph.contains(unused));
+  CHECK(graph.contains(a));
+  CHECK(graph.contains(b));
+  CHECK_EQ(b.inputs()[0].id(), a.id());
+  graph.validate();
+  CHECK(array_equal(graph.outputs()[0], array({1.0f, 2.0f})).item<bool>());
+}
+
+TEST_CASE("test compile graph shared broadcast") {
+  auto x = array({-2.0f});
+  auto fun = [](const std::vector<array>& inputs) -> std::vector<array> {
+    auto b = broadcast_to(inputs[0], {4});
+    return {negative(abs(b)), sum(b), b};
+  };
+  auto outputs = compile(fun)({x});
+  const auto& primitive = outputs[0].primitive();
+  CHECK_EQ(typeid(primitive), typeid(Compiled));
+  auto expected = fun({x});
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    CHECK(array_equal(outputs[i], expected[i]).item<bool>());
+  }
+}
+
+TEST_CASE("test compile shape queries") {
+  auto x = array(Shape{2, 1}, float32, nullptr, {});
+  auto y = array(Shape{2, 1}, float32, nullptr, {});
+  auto z = array(Shape{3, 1}, float32, nullptr, {});
+  detail::CompileContext context(
+      false, detail::CompileTarget::Compile, CompileMode::enabled);
+  CHECK_EQ(context.same_shape(x, y), detail::ShapeCheck::True);
+  CHECK_EQ(context.same_shape(x, z), detail::ShapeCheck::False);
+  CHECK_EQ(context.dimension_is(x, 1, 1), detail::ShapeCheck::True);
+  CHECK_EQ(context.dimension_is(x, 0, 1), detail::ShapeCheck::False);
+  context.shapeless = true;
+  CHECK_EQ(context.same_shape(x, y), detail::ShapeCheck::Unknown);
+  CHECK_EQ(context.same_shape(x, z), detail::ShapeCheck::Unknown);
+  CHECK_EQ(context.same_shape(x, x), detail::ShapeCheck::True);
+  CHECK_EQ(context.same_shape(x, array(1)), detail::ShapeCheck::False);
+  CHECK_EQ(context.dimension_is(x, 1, 1), detail::ShapeCheck::Unknown);
+  CHECK_EQ(context.same_shape(sin(x), sin(x)), detail::ShapeCheck::True);
+  CHECK_EQ(context.same_shape(sin(x), sin(y)), detail::ShapeCheck::Unknown);
+  CHECK_EQ(context.same_shape(sin(x), cos(x)), detail::ShapeCheck::Unknown);
+  CHECK_EQ(
+      context.same_shape(broadcast_to(x, {2, 2}), broadcast_to(x, {2, 3})),
+      detail::ShapeCheck::Unknown);
+}
+
+TEST_CASE("test compile pipeline export scope and streams") {
+  auto x = array({1.0f, 2.0f});
+  auto a = abs(x);
+  detail::CompileGraph graph({x}, {copy(negative(a))}, {});
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          false, detail::CompileTarget::Export, CompileMode::no_simplify));
+  graph.validate();
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Negative"));
+  CHECK_EQ(
+      graph.outputs()[0].inputs()[0].primitive().name(), std::string("Abs"));
+
+  auto stream = new_stream(default_device());
+  auto b = abs(x, stream);
+  detail::CompileGraph streams({x}, {a + b}, {});
+  detail::compile_optimize(
+      streams,
+      detail::CompileContext(
+          false, detail::CompileTarget::Compile, CompileMode::no_fuse));
+  const auto& inputs = streams.outputs()[0].inputs();
+  CHECK_NE(inputs[0].id(), inputs[1].id());
+  CHECK_NE(inputs[0].primitive().stream(), inputs[1].primitive().stream());
+  CHECK(array_equal(streams.outputs()[0], array({2.0f, 4.0f})).item<bool>());
+}
+
+TEST_CASE("test compile simplify nested duplicates") {
+  auto x = array({-1.0f, 2.0f});
+  auto a = x;
+  auto b = x;
+  for (int i = 0; i < 8; ++i) {
+    a = sin(a);
+    b = sin(b);
+  }
+  detail::CompileGraph graph({x}, {a + b}, {});
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          false, detail::CompileTarget::Compile, CompileMode::no_fuse));
+  graph.validate();
+  CHECK_EQ(graph.tape().size(), 10);
+  const auto& inputs = graph.outputs()[0].inputs();
+  CHECK_EQ(inputs[0].id(), inputs[1].id());
+  CHECK(array_equal(graph.outputs()[0], a + b).item<bool>());
+}
+
+TEST_CASE("test compile pass shape guards") {
+  auto x = array({-1.0f, 2.0f});
+  auto y = array({3.0f, 4.0f});
+  for (bool shapeless : {false, true}) {
+    detail::CompileContext context(
+        shapeless, detail::CompileTarget::Compile, CompileMode::no_fuse);
+    detail::CompileGraph duplicates({x}, {sin(x) + sin(x)}, {});
+    detail::compile_optimize(duplicates, context);
+    duplicates.validate();
+    const auto& inputs = duplicates.outputs()[0].inputs();
+    CHECK_EQ(inputs[0].id(), inputs[1].id());
+
+    auto a = abs(x);
+    detail::CompileGraph outputs({x, y}, {a, a + y, a}, {});
+    context.mode = CompileMode::enabled;
+    detail::compile_optimize(outputs, context);
+    outputs.validate();
+    const auto& primitive = outputs.outputs()[0].primitive();
+    CHECK_EQ(typeid(primitive) == typeid(Compiled), !shapeless);
+    CHECK_EQ(outputs.outputs()[0].id(), outputs.outputs()[2].id());
+  }
+}
+
+TEST_CASE("test compile simplification pass order") {
+  auto x = array({-1.0f, 2.0f});
+  for (bool shapeless : {false, true}) {
+    for (auto target :
+         {detail::CompileTarget::Compile, detail::CompileTarget::Export}) {
+      auto a = sin(copy(x) + array(1.0f));
+      auto b = sin(stop_gradient(copy(x)) + array(1.0f));
+      auto output = a + b;
+      detail::CompileGraph graph({x}, {output, output}, {});
+      detail::compile_optimize(
+          graph,
+          detail::CompileContext(
+              shapeless,
+              target,
+              target == detail::CompileTarget::Compile
+                  ? CompileMode::no_fuse
+                  : CompileMode::no_simplify));
+      graph.validate();
+      CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[1].id());
+      const auto& inputs = graph.outputs()[0].inputs();
+      CHECK_EQ(inputs[0].id(), inputs[1].id());
+      for (const auto& node : graph.tape()) {
+        if (node.has_primitive()) {
+          const auto& primitive = node.primitive();
+          CHECK_NE(typeid(primitive), typeid(Copy));
+          CHECK_NE(typeid(primitive), typeid(StopGradient));
+          CHECK_NE(typeid(primitive), typeid(Compiled));
+        }
+      }
+      CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+    }
+  }
+}
 
 std::vector<array> simple_fun(const std::vector<array>& inputs) {
   return std::vector<array>{inputs[0] + inputs[1]};
