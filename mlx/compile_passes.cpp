@@ -254,20 +254,20 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
       return;
     }
 
-    bool all_parents_in = true;
+    bool all_consumers_in = true;
     if (depth > 0) {
-      auto& parents = graph.consumers().at(a.id());
-      for (auto& [p, idx] : parents) {
-        auto in_cache = cache.find(p.id()) != cache.end();
+      auto& consumers = graph.consumers().at(a.id());
+      for (auto& [consumer, index] : consumers) {
+        auto in_cache = cache.find(consumer.id()) != cache.end();
         if (!in_cache) {
-          all_parents_in = false;
+          all_consumers_in = false;
           break;
         }
       }
     }
 
     // Split broadcasts that also have consumers outside the fused region.
-    if (!all_parents_in) {
+    if (!all_consumers_in) {
       if (a.has_primitive() && is_broadcast(a.primitive()) &&
           input_set.size() < max_compile_arrays) {
         auto copy = graph.split_uses(a, cache);

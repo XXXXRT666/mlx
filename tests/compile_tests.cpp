@@ -814,7 +814,7 @@ auto uncompilable_inputs_order_matters(const std::vector<array>& inputs) {
   return std::vector<array>{x / abs(exp(y)), sum(x, true)};
 }
 
-TEST_CASE("test compile tape with outside parents") {
+TEST_CASE("test compile tape with outside consumers") {
   {
     auto cfun = compile(unary_with_two_outputs);
     auto x = array({2.0, 2.0});
@@ -875,10 +875,10 @@ TEST_CASE("test compile across streams") {
   auto& p1 = out.primitive();
   CHECK_EQ(typeid(p1), typeid(Compiled));
   CHECK_EQ(out.inputs().size(), 1);
-  auto child = out.inputs()[0];
-  auto& p2 = child.primitive();
+  auto input = out.inputs()[0];
+  auto& p2 = input.primitive();
   CHECK_EQ(typeid(p2), typeid(Compiled));
-  CHECK_EQ(child.inputs()[0].id(), x.id());
+  CHECK_EQ(input.inputs()[0].id(), x.id());
 }
 
 auto unary_compile_outputs(const std::vector<array>& inputs) {

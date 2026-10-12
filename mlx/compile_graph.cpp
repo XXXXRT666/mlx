@@ -154,8 +154,8 @@ void CompileGraph::update_depths(std::vector<array> candidates) {
     for (const auto& out : a.outputs()) {
       depths_[out.id()] = depth;
       if (auto it = consumers_.find(out.id()); it != consumers_.end()) {
-        for (const auto& [parent, _] : it->second) {
-          candidates.push_back(parent);
+        for (const auto& [consumer, _] : it->second) {
+          candidates.push_back(consumer);
         }
       }
     }
@@ -217,14 +217,14 @@ void CompileGraph::replace_outputs(
     auto it = replacements.find(a.id());
     return it == replacements.end() ? a : it->second.next;
   };
-  auto remove_use = [&](uintptr_t id, uintptr_t parent_id, int index) {
+  auto remove_use = [&](uintptr_t id, uintptr_t consumer_id, int index) {
     auto it = consumers_.find(id);
     if (it == consumers_.end()) {
       return;
     }
     auto& uses = it->second;
     auto use = std::find_if(uses.begin(), uses.end(), [&](const auto& entry) {
-      return entry.first.id() == parent_id && entry.second == index;
+      return entry.first.id() == consumer_id && entry.second == index;
     });
     if (use != uses.end()) {
       *use = std::move(uses.back());
@@ -257,11 +257,11 @@ void CompileGraph::replace_outputs(
     if (id == next.id()) {
       continue;
     }
-    for (const auto& [parent, index] : entry.uses) {
-      if (!retained.contains(parent.id())) {
-        remove_use(id, parent.id(), index);
-        consumers_[next.id()].emplace_back(parent, index);
-        changes.emplace_back(parent, index, next);
+    for (const auto& [consumer, index] : entry.uses) {
+      if (!retained.contains(consumer.id())) {
+        remove_use(id, consumer.id(), index);
+        consumers_[next.id()].emplace_back(consumer, index);
+        changes.emplace_back(consumer, index, next);
       }
     }
   }
@@ -297,10 +297,10 @@ void CompileGraph::replace_outputs(
     }
   }
   std::vector<array> changed;
-  for (auto& [parent, index, next] : changes) {
-    if (depths_.contains(parent.id())) {
-      parent.inputs()[index] = next;
-      changed.push_back(parent);
+  for (auto& [consumer, index, next] : changes) {
+    if (depths_.contains(consumer.id())) {
+      consumer.inputs()[index] = next;
+      changed.push_back(consumer);
     }
   }
   if (!roots.empty() || !changed.empty()) {
@@ -322,9 +322,9 @@ array CompileGraph::split_uses(
   auto& selected = consumers_[copy.id()];
   auto& remaining = consumers_.at(id);
   for (size_t i = 0; i < remaining.size();) {
-    auto& [parent, index] = remaining[i];
-    if (consumer_ids.contains(parent.id())) {
-      parent.inputs()[index] = copy;
+    auto& [consumer, index] = remaining[i];
+    if (consumer_ids.contains(consumer.id())) {
+      consumer.inputs()[index] = copy;
       selected.push_back(std::move(remaining[i]));
       remaining[i] = std::move(remaining.back());
       remaining.pop_back();
@@ -383,13 +383,13 @@ void CompileGraph::validate() {
     }
   }
   for (const auto& [id, uses] : consumers_) {
-    for (const auto& [parent, index] : uses) {
-      if (!seen.contains(parent.id()) || index < 0 ||
-          index >= parent.inputs().size() ||
-          parent.inputs()[index].id() != id) {
+    for (const auto& [consumer, index] : uses) {
+      if (!seen.contains(consumer.id()) || index < 0 ||
+          index >= consumer.inputs().size() ||
+          consumer.inputs()[index].id() != id) {
         throw std::logic_error("[compile] Invalid consumer map.");
       }
-      auto& used = used_inputs.at(parent.id());
+      auto& used = used_inputs.at(consumer.id());
       if (used[index]) {
         throw std::logic_error("[compile] Duplicate consumer.");
       }
