@@ -12,6 +12,23 @@ import mlx_tests
 
 
 class TestExportImport(mlx_tests.MLXTestCase):
+    def test_export_inverse_transposes(self):
+        def fun(x):
+            inner = x.transpose(1, 2, 0)
+            outer = inner.transpose(2, 0, 1)
+            return inner, outer, outer
+
+        for shapeless in (False, True):
+            path = os.path.join(self.test_dir, "inverse_transposes.mlxfn")
+            sample = mx.arange(24).reshape(2, 3, 4)
+            mx.export_function(path, fun, sample, shapeless=shapeless)
+            imported = mx.import_function(path)
+            for n in (2, 5, 0) if shapeless else (2,):
+                x = mx.arange(n * 12).reshape(n, 3, 4)
+                for actual, expected in zip(imported(x), fun(x)):
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertTrue(mx.array_equal(actual, expected))
+
     def test_export_repeated_outputs_after_simplification(self):
         def fun(x):
             quotient, remainder = mx.divmod(x, mx.array(3, dtype=x.dtype))

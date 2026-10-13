@@ -82,6 +82,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "reorder_pointwise_views",
                         "reorder_pointwise_selections",
                         "reorder_pointwise_concatenations",
+                        "eliminate_inverse_transposes",
                         "eliminate_common_subexpressions",
                         "fuse_pointwise",
                     )
@@ -233,6 +234,61 @@ assert outputs[0].shape == (1,) and outputs[1].shape == (3,)
         self.assertIn("contract=shapeless result=Unknown", stderr)
         self.assertIn("event=hit", stderr)
         self.assertNotIn("condition=shape ", stderr)
+
+    def test_inverse_transposes(self):
+        for shapeless in (False, True):
+            traces = []
+
+            def fun(x):
+                traces.append(1)
+                inner = x.transpose(1, -1, 0)
+                outer = inner.transpose(2, 0, 1)
+                return inner, outer, outer, mx.sin(outer)
+
+            compiled = mx.compile(fun, shapeless=shapeless)
+            inputs = (
+                mx.arange(24, dtype=mx.float32).reshape(2, 3, 4),
+                mx.arange(48, dtype=mx.float32).reshape(4, 3, 4)[::2],
+                mx.arange(24, dtype=mx.float32).reshape(2, 3, 4).transpose(1, 0, 2),
+                mx.zeros((0, 2, 4)),
+            )
+            for x in inputs:
+                outputs = compiled(x)
+                expected = (x.transpose(1, 2, 0), x, x, mx.sin(x))
+                for actual, reference in zip(outputs, expected):
+                    self.assertEqual(actual.shape, reference.shape)
+                    self.assertTrue(mx.array_equal(actual, reference))
+            self.assertEqual(len(traces), 1 if shapeless else 3)
+
+        def identity(x):
+            return x.transpose(1, 2, 0).transpose(2, 0, 1)
+
+        x = mx.arange(24, dtype=mx.float32).reshape(2, 3, 4)
+
+        def loss(x):
+            return mx.sum(mx.square(identity(x)))
+
+        for grad in (mx.grad(mx.compile(loss)), mx.compile(mx.grad(loss))):
+            self.assertTrue(mx.array_equal(grad(x), 2 * x))
+        batch = mx.stack((x, x + 1))
+        for mapped in (mx.vmap(mx.compile(identity)), mx.compile(mx.vmap(identity))):
+            self.assertTrue(mx.array_equal(mapped(batch), batch))
+
+    def test_inverse_transpose_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+x = mx.arange(9).reshape(3, 3)
+mx.compile(lambda x: x.T.T, shapeless=True)(x)
+mx.compile(lambda x: x.T.transpose(0, 1))(x)
+s = mx.new_stream(mx.default_device())
+mx.compile(lambda x: mx.transpose(x.T, stream=s))(x)
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=inverse_transposes", stderr)
+        self.assertIn("check=inverse_permutation", stderr)
+        self.assertIn("reason=index_map_mismatch", stderr)
+        self.assertIn("reason=stream_mismatch", stderr)
 
     def test_simple_compile(self):
         def fun(x, y):

@@ -5,8 +5,10 @@
 
 #include "doctest/doctest.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 
 #include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
@@ -287,6 +289,73 @@ TEST_CASE("test compile simplification pass order") {
       CHECK(array_equal(graph.outputs()[0], output).item<bool>());
     }
   }
+}
+
+TEST_CASE("test compile inverse transposes") {
+  for (const Shape& shape :
+       {Shape{}, Shape{4}, Shape{2, 3, 4}, Shape{0, 3, 4}}) {
+    auto x = array(shape, float32, nullptr, {});
+    std::vector<int> axes(shape.size());
+    std::iota(axes.begin(), axes.end(), 0);
+    do {
+      std::vector<int> inverse(axes.size());
+      for (int i = 0; i < axes.size(); ++i) {
+        inverse[axes[i]] = i;
+      }
+      for (bool shapeless : {false, true}) {
+        for (auto target :
+             {detail::CompileTarget::Compile, detail::CompileTarget::Export}) {
+          auto output = transpose(transpose(x, axes), inverse);
+          detail::CompileGraph graph({x}, {output, output}, {});
+          detail::compile_optimize(
+              graph,
+              detail::CompileContext(shapeless, target, CompileMode::no_fuse));
+          graph.validate();
+          CHECK_EQ(graph.tape().size(), 1);
+          CHECK_EQ(graph.outputs()[0].id(), x.id());
+          CHECK_EQ(graph.outputs()[1].id(), x.id());
+        }
+      }
+    } while (std::next_permutation(axes.begin(), axes.end()));
+  }
+}
+
+TEST_CASE("test compile inverse transpose consumers and guards") {
+  auto x = reshape(arange(9), {3, 3});
+  auto inner = transpose(x);
+  auto outer = transpose(inner);
+  detail::CompileContext context(
+      false, detail::CompileTarget::Compile, CompileMode::no_fuse);
+  detail::CompileGraph shared({x}, {inner, outer, outer, negative(outer)}, {});
+  detail::compile_optimize(shared, context);
+  shared.validate();
+  CHECK_EQ(shared.outputs()[0].primitive().name(), std::string("Transpose"));
+  CHECK_EQ(shared.outputs()[1].id(), x.id());
+  CHECK_EQ(shared.outputs()[2].id(), x.id());
+  CHECK_EQ(shared.outputs()[3].inputs()[0].id(), x.id());
+
+  auto stream = new_stream(default_device());
+  for (auto output : {transpose(inner, {0, 1}), transpose(inner, stream)}) {
+    detail::CompileGraph graph({x}, {output}, {});
+    detail::compile_optimize(graph, context);
+    graph.validate();
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Transpose"));
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+  detail::CompileGraph disabled({x}, {outer}, {});
+  context.mode = CompileMode::no_simplify;
+  detail::compile_optimize(disabled, context);
+  CHECK_EQ(disabled.outputs()[0].primitive().name(), std::string("Transpose"));
+
+  auto chain = x;
+  for (int i = 0; i < 8; ++i) {
+    chain = transpose(chain);
+  }
+  detail::CompileGraph graph({x}, {chain}, {});
+  context.mode = CompileMode::no_fuse;
+  detail::compile_optimize(graph, context);
+  graph.validate();
+  CHECK_EQ(graph.outputs()[0].id(), x.id());
 }
 
 TEST_CASE("test compile runner with a separate pass list") {

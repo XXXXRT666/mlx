@@ -141,6 +141,54 @@ void remove_noops(CompileGraph& graph, const CompileContext& context) {
   }
 }
 
+void eliminate_inverse_transposes(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& a : candidates) {
+    if (!graph.contains(a) || !a.has_primitive()) {
+      continue;
+    }
+    auto& primitive = a.primitive();
+    if (typeid(primitive) != typeid(Transpose)) {
+      continue;
+    }
+    const auto& inner = a.inputs()[0];
+    if (!inner.has_primitive()) {
+      continue;
+    }
+    auto& inner_primitive = inner.primitive();
+    if (typeid(inner_primitive) != typeid(Transpose)) {
+      continue;
+    }
+    auto p = static_cast<const Transpose&>(inner_primitive).state();
+    auto q = static_cast<const Transpose&>(primitive).state();
+    std::string_view reason;
+    if (primitive.stream() != inner_primitive.stream()) {
+      reason = "stream_mismatch";
+    } else {
+      for (int i = 0; i < q.size(); ++i) {
+        if (p[q[i]] != i) {
+          reason = "index_map_mismatch";
+          break;
+        }
+      }
+    }
+    context.log.write(CompileLogCategory::Guards, [&] {
+      return fmt::format(
+          "rule=inverse_transposes check_stage=compile check=inverse_permutation node={} result={} reason={}",
+          a.id(),
+          reason.empty() ? "True" : "False",
+          reason.empty() ? "proven" : reason);
+    });
+    if (reason.empty()) {
+      auto input = inner.inputs()[0];
+      graph.replace_outputs({a}, {input});
+      context.log_rewrite("inverse_transposes", a, input);
+    }
+  }
+}
+
 void eliminate_common_subexpressions(
     CompileGraph& graph,
     const CompileContext& context) {
@@ -479,6 +527,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
        PassScope::CompileAndExport},
       {"reorder_pointwise_concatenations",
        reorder_pointwise_concatenations,
+       PassScope::CompileAndExport},
+      {"eliminate_inverse_transposes",
+       eliminate_inverse_transposes,
        PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,
