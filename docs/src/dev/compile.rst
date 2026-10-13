@@ -26,11 +26,33 @@ the tape after each pass; validation builds also check graph invariants.
 The runner does not repeat the stage list. A local worklist or loop must have
 a termination argument.
 
-Use ``context.same_shape`` and ``context.dimension_is`` for existing shape
+Use ``context.same_shape``, ``context.dimension_is``, and
+``context.size_at_most`` for existing shape
 queries. Only ``True`` proves a condition. In shapeless mode, sample sizes
 do not become fixed dimensions. Rank, dtype, primitive attributes, and other
 ordinary conditions can be checked directly. Replacement construction runs
 under the same tracing and export context as the pass.
+
+Indexing and Pointwise Operations
+--------------------------------
+
+Three small passes in ``mlx/compile_reorder.cpp`` run before view elimination:
+
+* Move pointwise operations before matching reshapes, axis permutations, and
+  broadcasts. All operands must have the same index mapping, or be uniform
+  scalars in a static graph. Repeat and tile use reshape and broadcast nodes.
+  Defer view chains until a boundary to avoid rebuilding them for each operation.
+* Move slices and gathers before an unshared pointwise producer when the
+  selected domain is no larger. Index operands stay attached to the selection.
+* Factor a common pointwise operation out of concatenation branches. Keep one
+  concatenated operand and identical uniform scalars, without increasing the
+  concatenation's element size. This does not distribute computations into
+  branches in anticipation of fusion.
+
+Each pass moves in one direction and preserves primitive parameters, dtypes,
+and streams. Unknown shape proofs and shared producers keep their original
+form. The original view remains to enforce its shape checks. Reordering alone
+does not add matmul or reduction support to the pointwise fuser.
 
 Diagnostics
 -----------

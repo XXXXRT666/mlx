@@ -476,6 +476,23 @@ ShapeCheck CompileContext::same_shape(const array& a, const array& b) const {
   return result;
 }
 
+ShapeCheck CompileContext::size_at_most(const array& a, const array& b) const {
+  auto result = shapeless    ? ShapeCheck::Unknown
+      : a.size() <= b.size() ? ShapeCheck::True
+                             : ShapeCheck::False;
+  log.write(CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "check_stage=compile check=size_at_most node={} other={} contract={} result={}",
+        a.id(),
+        b.id(),
+        shapeless ? "shapeless" : "static",
+        result == ShapeCheck::True        ? "True"
+            : result == ShapeCheck::False ? "False"
+                                          : "Unknown");
+  });
+  return result;
+}
+
 ShapeCheck CompileContext::dimension_is(const array& a, int axis, int size)
     const {
   auto result = shapeless     ? ShapeCheck::Unknown

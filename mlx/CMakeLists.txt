@@ -5,6 +5,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/compile_graph.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compile_logging.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compile_passes.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/compile_reorder.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/dtype.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/dtype_utils.cpp

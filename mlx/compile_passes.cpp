@@ -63,7 +63,7 @@ bool is_noop(const Primitive& p) {
 }
 
 bool is_fusable(const Primitive& p) {
-  return is_unary(p) || is_binary(p) || is_ternary(p) || is_broadcast(p);
+  return is_pointwise(p) || is_broadcast(p);
 }
 
 static inline uint64_t splitmix64(uint64_t x) noexcept {
@@ -426,6 +426,10 @@ void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
 
 } // namespace
 
+bool is_pointwise(const Primitive& p) {
+  return is_unary(p) || is_binary(p) || is_ternary(p);
+}
+
 void run_compile_passes(
     CompileGraph& graph,
     const CompileContext& context,
@@ -467,6 +471,15 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
   static constexpr PassSpec canonicalize_passes[] = {
       {"deduplicate_scalars", deduplicate_scalars, PassScope::CompileAndExport},
       {"remove_noops", remove_noops, PassScope::CompileAndExport},
+      {"reorder_pointwise_views",
+       reorder_pointwise_views,
+       PassScope::CompileAndExport},
+      {"reorder_pointwise_selections",
+       reorder_pointwise_selections,
+       PassScope::CompileAndExport},
+      {"reorder_pointwise_concatenations",
+       reorder_pointwise_concatenations,
+       PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,
        PassScope::CompileAndExport},

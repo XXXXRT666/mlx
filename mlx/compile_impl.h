@@ -115,6 +115,7 @@ struct CompileContext {
       CompileLog log = CompileLog{});
 
   ShapeCheck same_shape(const array& a, const array& b) const;
+  ShapeCheck size_at_most(const array& a, const array& b) const;
   ShapeCheck dimension_is(const array& a, int axis, int size) const;
   void log_rewrite(
       std::string_view rule,
@@ -143,6 +144,17 @@ void run_compile_passes(
     std::span<const PassSpec> passes);
 
 void compile_optimize(CompileGraph& graph, const CompileContext& context);
+
+bool is_pointwise(const Primitive& primitive);
+void reorder_pointwise_views(
+    CompileGraph& graph,
+    const CompileContext& context);
+void reorder_pointwise_selections(
+    CompileGraph& graph,
+    const CompileContext& context);
+void reorder_pointwise_concatenations(
+    CompileGraph& graph,
+    const CompileContext& context);
 
 std::vector<array> compile_replace(
     const std::vector<array>& tape,

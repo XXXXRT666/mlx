@@ -79,11 +79,14 @@ assert mx.array_equal(first[::-1], second).item()
                     pass_names = (
                         "deduplicate_scalars",
                         "remove_noops",
+                        "reorder_pointwise_views",
+                        "reorder_pointwise_selections",
+                        "reorder_pointwise_concatenations",
                         "eliminate_common_subexpressions",
                         "fuse_pointwise",
                     )
-                    self.assertEqual(len(passes), 4)
-                    self.assertEqual(len(export), 3)
+                    self.assertEqual(len(passes), len(pass_names))
+                    self.assertEqual(len(export), len(pass_names) - 1)
                     for lines in (passes, export):
                         for name, line in zip(pass_names, lines):
                             self.assertIn(f"pass={name} ", line)
