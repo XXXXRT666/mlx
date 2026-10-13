@@ -233,6 +233,97 @@ void eliminate_roundtrip_views(
   }
 }
 
+void eliminate_split_concat(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& a : candidates) {
+    if (!graph.contains(a) || !a.has_primitive()) {
+      continue;
+    }
+    auto& primitive = a.primitive();
+    if (typeid(primitive) != typeid(Concatenate)) {
+      continue;
+    }
+    auto axis = static_cast<const Concatenate&>(primitive).state();
+    const auto& parts = a.inputs();
+    const auto& first = parts[0];
+    auto* split = dynamic_cast<Split*>(first.primitive_ptr().get());
+    auto* first_slice = dynamic_cast<Slice*>(first.primitive_ptr().get());
+    auto input = split || first_slice ? first.inputs()[0] : first;
+    auto shape = context.same_shape(a, input);
+    std::string_view reason;
+    if (shape != ShapeCheck::True) {
+      reason =
+          shape == ShapeCheck::False ? "shape_mismatch" : "shape_not_proven";
+    } else if (split) {
+      auto [indices, split_axis] = split->state();
+      if (split_axis != axis || parts.size() != indices.size() + 1) {
+        reason = "index_map_mismatch";
+      } else if (split->stream() != primitive.stream()) {
+        reason = "stream_mismatch";
+      } else {
+        auto outputs = first.outputs();
+        for (size_t i = 0; i < parts.size(); ++i) {
+          if (parts[i].id() != outputs[i].id()) {
+            reason = "index_map_mismatch";
+            break;
+          }
+        }
+      }
+    } else {
+      int offset = 0;
+      for (const auto& part : parts) {
+        if (part.id() == input.id()) {
+          if (offset != 0) {
+            reason = "index_map_mismatch";
+            break;
+          }
+          offset = input.shape(axis);
+          continue;
+        }
+        auto* slice = dynamic_cast<Slice*>(part.primitive_ptr().get());
+        if (!slice || part.inputs()[0].id() != input.id()) {
+          reason = "index_map_mismatch";
+          break;
+        }
+        if (slice->stream() != primitive.stream()) {
+          reason = "stream_mismatch";
+          break;
+        }
+        auto [start, stop, strides] = slice->state();
+        for (int d = 0; d < input.ndim(); ++d) {
+          if (strides[d] != 1 || start[d] != (d == axis ? offset : 0) ||
+              (d != axis && stop[d] != input.shape(d))) {
+            reason = "index_map_mismatch";
+            break;
+          }
+        }
+        if (stop[axis] < offset || stop[axis] > input.shape(axis)) {
+          reason = "index_map_mismatch";
+        }
+        if (!reason.empty()) {
+          break;
+        }
+        offset = stop[axis];
+      }
+      if (reason.empty() && offset != input.shape(axis)) {
+        reason = "index_map_mismatch";
+      }
+    }
+    context.log.write(CompileLogCategory::Guards, [&] {
+      return fmt::format(
+          "rule=split_concat check_stage=compile node={} reason={}",
+          a.id(),
+          reason.empty() ? "proven" : reason);
+    });
+    if (reason.empty()) {
+      graph.replace_outputs({a}, {input});
+      context.log_rewrite("split_concat", a, input);
+    }
+  }
+}
+
 void eliminate_common_subexpressions(
     CompileGraph& graph,
     const CompileContext& context) {
@@ -577,6 +668,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
        PassScope::CompileAndExport},
       {"eliminate_roundtrip_views",
        eliminate_roundtrip_views,
+       PassScope::CompileAndExport},
+      {"eliminate_split_concat",
+       eliminate_split_concat,
        PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,

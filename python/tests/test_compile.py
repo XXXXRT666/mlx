@@ -84,6 +84,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "reorder_pointwise_concatenations",
                         "eliminate_inverse_transposes",
                         "eliminate_roundtrip_views",
+                        "eliminate_split_concat",
                         "eliminate_common_subexpressions",
                         "fuse_pointwise",
                     )
@@ -342,6 +343,67 @@ mx.compile(fun, shapeless=True)(x)
             "passes,guards",
         )
         self.assertIn("event=rewrite rule=roundtrip_views", stderr)
+        self.assertIn("reason=shape_not_proven", stderr)
+
+    def test_split_concat(self):
+        for indices in ([3, 7], [0, 3, 12], [3, 3, 7], list(range(1, 12))):
+
+            def fun(x):
+                parts = mx.split(x, indices, axis=1)
+                output = mx.concatenate(parts, axis=1)
+                return parts[0], output, output
+
+            compiled = mx.compile(fun)
+            for x in (
+                mx.arange(24).reshape(2, 12),
+                mx.arange(48).reshape(2, 24)[:, ::2],
+                mx.zeros((0, 12)),
+                mx.zeros((2, 0)),
+            ):
+                for actual, expected in zip(compiled(x), fun(x)):
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertTrue(mx.array_equal(actual, expected))
+
+        def identity(x):
+            return mx.concatenate(mx.split(x, [1, 2], axis=1), axis=1)
+
+        def loss(x):
+            return mx.sum(mx.square(identity(x)))
+
+        x = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+        for grad in (mx.grad(mx.compile(loss)), mx.compile(mx.grad(loss))):
+            self.assertTrue(mx.array_equal(grad(x), 2 * x))
+        batch = mx.stack((x, x + 1))
+        for mapped in (mx.vmap(mx.compile(identity)), mx.compile(mx.vmap(identity))):
+            self.assertTrue(mx.array_equal(mapped(batch), batch))
+
+    def test_split_concat_shapeless_guards(self):
+        for indices in ([2, 4], [0, 2, 6]):
+
+            def fun(x):
+                return mx.concatenate(mx.split(x, indices, axis=1), axis=1)
+
+            with self.assertRaisesRegex(ValueError, "cannot infer output shapes"):
+                mx.compile(fun, shapeless=True)(mx.arange(12).reshape(2, 6))
+
+        stderr = self.run_compile_log_test(
+            """
+x = mx.arange(12).reshape(2, 6)
+fun = lambda x: mx.concatenate(mx.split(x, [2, 4], axis=1), axis=1)
+mx.compile(fun)(x)
+mx.compile(lambda x: mx.concatenate(mx.split(x, [2, 4], axis=1)[::-1], axis=1))(x)
+try:
+    mx.compile(fun, shapeless=True)(x)
+except ValueError as e:
+    assert "cannot infer output shapes" in str(e)
+else:
+    raise AssertionError("Unproven shapeless split was removed")
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=split_concat", stderr)
+        self.assertIn("reason=index_map_mismatch", stderr)
         self.assertIn("reason=shape_not_proven", stderr)
 
     def test_simple_compile(self):

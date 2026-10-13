@@ -47,6 +47,22 @@ class TestExportImport(mlx_tests.MLXTestCase):
                 with self.assertRaises(ValueError):
                     imported(mx.arange(7))
 
+    def test_export_split_concat(self):
+        for indices in ([3, 7], [0, 3, 12], list(range(1, 12))):
+
+            def fun(x):
+                parts = mx.split(x, indices, axis=1)
+                output = mx.concatenate(parts, axis=1)
+                return output, parts[0], output
+
+            x = mx.arange(24).reshape(2, 12)
+            path = os.path.join(self.test_dir, "split_concat.mlxfn")
+            mx.export_function(path, fun, x)
+            imported = mx.import_function(path)
+            for actual, expected in zip(imported(x), fun(x)):
+                self.assertEqual(actual.dtype, expected.dtype)
+                self.assertTrue(mx.array_equal(actual, expected))
+
     def test_export_repeated_outputs_after_simplification(self):
         def fun(x):
             quotient, remainder = mx.divmod(x, mx.array(3, dtype=x.dtype))

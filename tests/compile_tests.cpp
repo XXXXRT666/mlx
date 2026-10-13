@@ -407,6 +407,108 @@ TEST_CASE("test compile roundtrip view guards") {
   CHECK_EQ(graph.outputs()[0].id(), x.id());
 }
 
+TEST_CASE("test compile split concat elimination") {
+  for (const Shape& shape : {Shape{2, 12}, Shape{0, 12}, Shape{2, 0}}) {
+    auto x = array(shape, float32, nullptr, {});
+    for (const Shape& indices :
+         {Shape{3, 7},
+          Shape{0, 3, 12},
+          Shape{3, 3, 7},
+          Shape{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}}) {
+      auto parts = split(x, indices, 1);
+      auto output = concatenate(parts, 1);
+      for (bool shapeless : {false, true}) {
+        for (auto target :
+             {detail::CompileTarget::Compile, detail::CompileTarget::Export}) {
+          detail::CompileGraph graph({x}, {output, parts[0], output}, {});
+          detail::compile_optimize(
+              graph,
+              detail::CompileContext(shapeless, target, CompileMode::no_fuse));
+          graph.validate();
+          CHECK_EQ(graph.outputs()[0].id() == x.id(), !shapeless);
+          CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[2].id());
+          CHECK_EQ(graph.outputs()[1].shape(), parts[0].shape());
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("test compile split concat guards") {
+  auto x = astype(reshape(arange(24), {2, 12}), int32);
+  auto parts = split(x, {4, 8}, 1);
+  auto other = split(x + array(1), {4, 8}, 1);
+  std::vector<Shape> shapes;
+  for (const auto& part : parts) {
+    shapes.push_back(part.shape());
+  }
+  auto replayed = array::make_arrays(
+      std::move(shapes),
+      std::vector<Dtype>(parts.size(), x.dtype()),
+      parts[0].primitive_ptr(),
+      {x + array(1)});
+  auto stream = new_stream(default_device());
+  std::vector<array> outputs{
+      concatenate({parts[2], parts[1], parts[0]}, 1),
+      concatenate({parts[0], parts[0], parts[2]}, 1),
+      concatenate({parts[0], negative(parts[1]), parts[2]}, 1),
+      concatenate({parts[0], other[1], parts[2]}, 1),
+      concatenate({parts[0], replayed[1], parts[2]}, 1),
+      concatenate(parts, 0),
+      concatenate(parts, 1, stream),
+      concatenate({slice(x, {0, 0}, {2, 6}), slice(x, {0, 4}, {2, 10})}, 1),
+      concatenate(
+          {slice(x, {0, 0}, {2, 12}, {1, 2}),
+           slice(x, {0, 1}, {2, 12}, {1, 2})},
+          1)};
+  for (const auto& output : outputs) {
+    detail::CompileGraph graph({x}, {output}, {});
+    detail::compile_optimize(
+        graph,
+        detail::CompileContext(
+            false, detail::CompileTarget::Compile, CompileMode::no_fuse));
+    graph.validate();
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Concatenate"));
+    CHECK_EQ(graph.outputs()[0].dtype(), output.dtype());
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+
+  auto fresh_parts = split(x, {4, 8}, 1);
+  auto promoted = concatenate(
+      {astype(fresh_parts[0], float32), fresh_parts[1], fresh_parts[2]}, 1);
+  detail::CompileGraph graph({x}, {promoted}, {});
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          false, detail::CompileTarget::Compile, CompileMode::no_fuse));
+  graph.validate();
+  const auto& output = graph.outputs()[0];
+  CHECK_EQ(output.primitive().name(), std::string("AsType"));
+  CHECK_EQ(output.inputs()[0].id(), x.id());
+  CHECK_EQ(output.dtype(), float32);
+  CHECK(array_equal(output, promoted).item<bool>());
+}
+
+TEST_CASE("test compile view elimination exposes pointwise fusion") {
+  const std::function<array(const array&)> views[] = {
+      [](const array& a) { return transpose(transpose(a)); },
+      [](const array& a) { return reshape(reshape(a, {6}), {2, 3}); },
+      [](const array& a) { return concatenate(split(a, {1, 2}, 1), 1); }};
+  for (auto dtype : {float32, float16, bfloat16}) {
+    auto x = astype(reshape(arange(6) * array(0.1f), {2, 3}), dtype);
+    for (const auto& view : views) {
+      auto fun = [&](const std::vector<array>& inputs) {
+        return std::vector<array>{abs(view(exp(inputs[0])))};
+      };
+      auto output = compile(fun)({x})[0];
+      const auto& primitive = output.primitive();
+      CHECK_EQ(typeid(primitive), typeid(Compiled));
+      CHECK_EQ(output.dtype(), dtype);
+      CHECK(allclose(output, fun({x})[0], 1e-3, 1e-3).item<bool>());
+    }
+  }
+}
+
 TEST_CASE("test compile runner with a separate pass list") {
   auto remove_copy = [](detail::CompileGraph& graph,
                         const detail::CompileContext& context) {
