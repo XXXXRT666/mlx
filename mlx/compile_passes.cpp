@@ -189,6 +189,50 @@ void eliminate_inverse_transposes(
   }
 }
 
+void eliminate_roundtrip_views(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& a : candidates) {
+    if (!graph.contains(a) || !a.has_primitive()) {
+      continue;
+    }
+    auto& primitive = a.primitive();
+    if (typeid(primitive) != typeid(Reshape)) {
+      continue;
+    }
+    const auto& inner = a.inputs()[0];
+    if (!inner.has_primitive()) {
+      continue;
+    }
+    auto& inner_primitive = inner.primitive();
+    if (typeid(inner_primitive) != typeid(Reshape)) {
+      continue;
+    }
+    auto input = inner.inputs()[0];
+    std::string_view reason;
+    if (primitive.stream() != inner_primitive.stream()) {
+      reason = "stream_mismatch";
+    } else {
+      auto shape = context.same_shape(a, input);
+      if (shape != ShapeCheck::True) {
+        reason =
+            shape == ShapeCheck::False ? "shape_mismatch" : "shape_not_proven";
+      }
+    }
+    context.log.write(CompileLogCategory::Guards, [&] {
+      return fmt::format(
+          "rule=roundtrip_views check_stage=compile node={} reason={}",
+          a.id(),
+          reason.empty() ? "proven" : reason);
+    });
+    if (reason.empty()) {
+      graph.replace_outputs({a}, {input});
+      context.log_rewrite("roundtrip_views", a, input);
+    }
+  }
+}
+
 void eliminate_common_subexpressions(
     CompileGraph& graph,
     const CompileContext& context) {
@@ -530,6 +574,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
        PassScope::CompileAndExport},
       {"eliminate_inverse_transposes",
        eliminate_inverse_transposes,
+       PassScope::CompileAndExport},
+      {"eliminate_roundtrip_views",
+       eliminate_roundtrip_views,
        PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,

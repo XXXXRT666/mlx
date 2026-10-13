@@ -358,6 +358,55 @@ TEST_CASE("test compile inverse transpose consumers and guards") {
   CHECK_EQ(graph.outputs()[0].id(), x.id());
 }
 
+TEST_CASE("test compile roundtrip views") {
+  for (const Shape& shape : {Shape{2, 3}, Shape{0, 3}, Shape{}}) {
+    auto x = array(shape, float32, nullptr, {});
+    auto middle_shape = shape.empty() ? Shape{1} : Shape{shape[0] * 3};
+    auto inner = reshape(x, middle_shape);
+    auto outer = reshape(inner, shape);
+    for (bool shapeless : {false, true}) {
+      for (auto target :
+           {detail::CompileTarget::Compile, detail::CompileTarget::Export}) {
+        detail::CompileGraph graph({x}, {inner, outer, outer}, {});
+        detail::compile_optimize(
+            graph,
+            detail::CompileContext(shapeless, target, CompileMode::no_fuse));
+        graph.validate();
+        CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Reshape"));
+        CHECK_EQ(
+            graph.outputs()[1].id() == x.id(), !shapeless || shape.empty());
+        CHECK_EQ(graph.outputs()[1].id(), graph.outputs()[2].id());
+      }
+    }
+  }
+}
+
+TEST_CASE("test compile roundtrip view guards") {
+  auto x = reshape(arange(6), {2, 3});
+  auto inner = reshape(x, {3, 2});
+  auto stream = new_stream(default_device());
+  detail::CompileContext context(
+      false, detail::CompileTarget::Compile, CompileMode::no_fuse);
+  for (auto output :
+       {reshape(inner, {6}),
+        reshape(inner, x.shape(), stream),
+        reshape(transpose(inner), {6})}) {
+    detail::CompileGraph graph({x}, {output}, {});
+    detail::compile_optimize(graph, context);
+    graph.validate();
+    CHECK_NE(graph.outputs()[0].id(), x.id());
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+  auto chain = x;
+  for (int i = 0; i < 8; ++i) {
+    chain = reshape(reshape(chain, {6}), {2, 3});
+  }
+  detail::CompileGraph graph({x}, {chain}, {});
+  detail::compile_optimize(graph, context);
+  graph.validate();
+  CHECK_EQ(graph.outputs()[0].id(), x.id());
+}
+
 TEST_CASE("test compile runner with a separate pass list") {
   auto remove_copy = [](detail::CompileGraph& graph,
                         const detail::CompileContext& context) {

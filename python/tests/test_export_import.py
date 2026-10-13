@@ -29,6 +29,24 @@ class TestExportImport(mlx_tests.MLXTestCase):
                     self.assertEqual(actual.shape, expected.shape)
                     self.assertTrue(mx.array_equal(actual, expected))
 
+    def test_export_roundtrip_views(self):
+        def fun(x):
+            inner = x.reshape(2, -1)
+            outer = inner.reshape(-1)
+            return inner, outer, outer
+
+        for shapeless in (False, True):
+            path = os.path.join(self.test_dir, "roundtrip_views.mlxfn")
+            mx.export_function(path, fun, mx.arange(6), shapeless=shapeless)
+            imported = mx.import_function(path)
+            for n in (6, 8) if shapeless else (6,):
+                x = mx.arange(n)
+                for actual, expected in zip(imported(x), fun(x)):
+                    self.assertTrue(mx.array_equal(actual, expected))
+            if shapeless:
+                with self.assertRaises(ValueError):
+                    imported(mx.arange(7))
+
     def test_export_repeated_outputs_after_simplification(self):
         def fun(x):
             quotient, remainder = mx.divmod(x, mx.array(3, dtype=x.dtype))

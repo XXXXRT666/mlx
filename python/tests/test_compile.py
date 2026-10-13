@@ -83,6 +83,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "reorder_pointwise_selections",
                         "reorder_pointwise_concatenations",
                         "eliminate_inverse_transposes",
+                        "eliminate_roundtrip_views",
                         "eliminate_common_subexpressions",
                         "fuse_pointwise",
                     )
@@ -289,6 +290,59 @@ mx.compile(lambda x: mx.transpose(x.T, stream=s))(x)
         self.assertIn("check=inverse_permutation", stderr)
         self.assertIn("reason=index_map_mismatch", stderr)
         self.assertIn("reason=stream_mismatch", stderr)
+
+    def test_roundtrip_views(self):
+        def fun(x):
+            inner = x.reshape(-1)
+            outer = inner.reshape(x.shape)
+            return inner, outer, outer, mx.sin(outer)
+
+        compiled = mx.compile(fun)
+        for x in (
+            mx.arange(12, dtype=mx.float32).reshape(4, 3),
+            mx.arange(24, dtype=mx.float32).reshape(4, 6)[:, ::2],
+            mx.arange(12, dtype=mx.float32).reshape(3, 4).T,
+            mx.zeros((0, 3)),
+        ):
+            for actual, expected in zip(compiled(x), fun(x)):
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertTrue(mx.array_equal(actual, expected))
+
+        def identity(x):
+            return x.reshape(3, 2).reshape(2, 3)
+
+        def loss(x):
+            return mx.sum(mx.square(identity(x)))
+
+        x = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+        for grad in (mx.grad(mx.compile(loss)), mx.compile(mx.grad(loss))):
+            self.assertTrue(mx.array_equal(grad(x), 2 * x))
+        batch = mx.stack((x, x + 1))
+        for mapped in (mx.vmap(mx.compile(identity)), mx.compile(mx.vmap(identity))):
+            self.assertTrue(mx.array_equal(mapped(batch), batch))
+
+    def test_roundtrip_views_shapeless_guards(self):
+        def fun(x):
+            return x.reshape(2, -1).reshape(-1)
+
+        compiled = mx.compile(fun, shapeless=True)
+        for n in (6, 8):
+            x = mx.arange(n)
+            self.assertTrue(mx.array_equal(compiled(x), x))
+        with self.assertRaises(ValueError):
+            compiled(mx.arange(7))
+
+        stderr = self.run_compile_log_test(
+            """
+x = mx.arange(6)
+fun = lambda x: x.reshape(2, -1).reshape(-1)
+mx.compile(fun)(x)
+mx.compile(fun, shapeless=True)(x)
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=roundtrip_views", stderr)
+        self.assertIn("reason=shape_not_proven", stderr)
 
     def test_simple_compile(self):
         def fun(x, y):
