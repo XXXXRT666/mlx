@@ -1,5 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
+import os
+import tempfile
+
 import mlx.core as mx
 import mlx_tests
 
@@ -173,6 +176,70 @@ else:
         self.assertIn("event=rewrite rule=split_concat", stderr)
         self.assertIn("reason=index_map_mismatch", stderr)
         self.assertIn("reason=shape_not_proven", stderr)
+
+    def assert_outputs(self, actual, expected):
+        actual = (actual,) if isinstance(actual, mx.array) else actual
+        expected = (expected,) if isinstance(expected, mx.array) else expected
+        self.assertEqual(len(actual), len(expected))
+        for a, b in zip(actual, expected):
+            self.assertEqual(a.shape, b.shape)
+            self.assertEqual(a.dtype, b.dtype)
+            self.assertTrue(mx.array_equal(a, b, equal_nan=True))
+
+    def test_concat_split(self):
+        for widths in ((2, 3), (0, 2, 0, 3, 0), (1,) * 12):
+            boundaries = []
+            for width in widths[:-1]:
+                boundaries.append((boundaries[-1] if boundaries else 0) + width)
+
+            def fun(*xs):
+                joined = mx.concatenate(xs, axis=1)
+                parts = mx.split(joined, boundaries, axis=1)
+                return (*parts[::-1], parts[0], joined)
+
+            for dtype in (mx.float32, mx.float16, mx.bfloat16, mx.int32):
+                inputs = [
+                    mx.arange(2 * w).reshape(2, w).astype(dtype)[:, ::-1]
+                    for w in widths
+                ]
+                compiled = mx.compile(fun)
+                self.assert_outputs(compiled(*inputs), fun(*inputs))
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, "concat_split.mlxfn")
+                    mx.export_function(path, fun, *inputs)
+                    self.assert_outputs(mx.import_function(path)(*inputs), fun(*inputs))
+
+    def test_concat_split_promotion_and_transforms(self):
+        def fun(a, b):
+            first, second = mx.split(mx.concatenate([a, b], axis=1), [2], axis=1)
+            return first, second, first
+
+        a = mx.arange(4).reshape(2, 2).astype(mx.int16)
+        b = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+        self.assert_outputs(mx.compile(fun)(a, b), fun(a, b))
+        a = a.astype(mx.float32)
+
+        def loss(a, b):
+            return sum(mx.sum(x) for x in fun(a, b))
+
+        self.assert_outputs(
+            mx.grad(mx.compile(loss), argnums=(0, 1))(a, b),
+            mx.grad(loss, argnums=(0, 1))(a, b),
+        )
+        batch_a, batch_b = mx.stack([a, a + 1]), mx.stack([b, b + 1])
+        self.assert_outputs(
+            mx.vmap(mx.compile(fun))(batch_a, batch_b), mx.vmap(fun)(batch_a, batch_b)
+        )
+
+    def test_concat_split_shapeless_preserves_validation(self):
+        for boundary in (0, 2):
+
+            def fun(a, b):
+                return mx.split(mx.concatenate([a, b]), [boundary])
+
+            compiled = mx.compile(fun, shapeless=True)
+            with self.assertRaisesRegex(ValueError, "infer output shapes"):
+                compiled(mx.ones((2,)), mx.ones((3,)))
 
 
 if __name__ == "__main__":

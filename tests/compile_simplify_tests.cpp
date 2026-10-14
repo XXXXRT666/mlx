@@ -304,3 +304,90 @@ TEST_CASE("test compile view elimination exposes pointwise fusion") {
     }
   }
 }
+
+namespace {
+
+detail::CompileGraph optimize(
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs,
+    bool shapeless = false) {
+  eval(inputs);
+  detail::CompileGraph graph(inputs, outputs, {});
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(
+          shapeless, detail::CompileTarget::Compile, CompileMode::no_fuse));
+  graph.validate();
+  return graph;
+}
+
+} // namespace
+
+TEST_CASE("test compile concat split preserves outputs and promotion") {
+  auto a = reshape(arange(4, float32), {2, 2});
+  auto b = reshape(arange(6, float32), {2, 3});
+  auto joined = concatenate({a, b}, 1);
+  auto parts = split(joined, Shape{2}, 1);
+  auto graph = optimize({a, b}, {parts[1], parts[0], parts[1], joined});
+  CHECK_EQ(graph.outputs()[0].id(), b.id());
+  CHECK_EQ(graph.outputs()[1].id(), a.id());
+  CHECK_EQ(graph.outputs()[2].id(), b.id());
+  CHECK_EQ(graph.outputs()[3].primitive().name(), std::string("Concatenate"));
+
+  auto x = array({1, 2}, int16);
+  auto y = array({3.5f, 4.5f, 5.5f});
+  parts = split(concatenate({x, y}), Shape{2});
+  graph = optimize({x, y}, parts);
+  CHECK_EQ(graph.outputs()[0].dtype(), float32);
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("AsType"));
+  CHECK_EQ(graph.outputs()[1].id(), y.id());
+  CHECK(array_equal(graph.outputs()[0], astype(x, float32)).item<bool>());
+
+  parts =
+      split(concatenate({astype(x, float32), astype(x, float32)}), Shape{2});
+  graph = optimize({x}, parts);
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("AsType"));
+  CHECK_EQ(graph.outputs()[0].inputs()[0].id(), x.id());
+  CHECK_EQ(graph.outputs()[1].primitive().name(), std::string("AsType"));
+  CHECK_EQ(graph.outputs()[1].inputs()[0].id(), x.id());
+}
+
+TEST_CASE("test compile concat slice exact segments") {
+  for (const std::vector<int>& widths :
+       {std::vector<int>{0, 2, 0, 3, 0}, std::vector<int>(12, 1)}) {
+    std::vector<array> inputs;
+    Shape boundaries;
+    int offset = 0;
+    for (auto width : widths) {
+      inputs.push_back(reshape(arange(2 * width, float32), {2, width}));
+      offset += width;
+      boundaries.push_back(offset);
+    }
+    boundaries.pop_back();
+    auto parts = split(concatenate(inputs, 1), boundaries, 1);
+    auto graph = optimize(inputs, parts);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      CHECK_EQ(graph.outputs()[i].dtype(), inputs[i].dtype());
+      CHECK_FALSE(graph.outputs()[i].has_primitive());
+      CHECK(array_equal(graph.outputs()[i], inputs[i]).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test compile concat split retains unproven mappings") {
+  auto a = reshape(arange(4, float32), {2, 2});
+  auto b = reshape(arange(6, float32), {2, 3});
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 5; ++variant) {
+    auto joined = concatenate({a, b}, 1);
+    auto output = variant == 0 ? split(joined, Shape{1}, 1)[0]
+        : variant == 1         ? split(joined, Shape{2}, 1, stream)[0]
+        : variant == 2         ? slice(joined, {0, 1}, {2, 4})
+        : variant == 3         ? slice(joined, {0, 0}, {2, 5}, {1, 2})
+                               : split(joined, Shape{2}, 1)[0];
+    auto name = std::string(output.primitive().name());
+    auto graph = optimize({a, b}, {output}, variant == 4);
+    CHECK_EQ(graph.outputs()[0].primitive().name(), name);
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+}

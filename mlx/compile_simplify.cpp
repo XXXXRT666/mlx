@@ -33,6 +33,19 @@ struct VecU64Hash {
   }
 };
 
+void log_skip(
+    const CompileContext& context,
+    const array& node,
+    std::string_view reason) {
+  context.log.write(CompileLogCategory::Guards, [&] {
+    return fmt::format(
+        "rule={} check_stage=compile node={} reason={}",
+        context.log.pass,
+        node.id(),
+        reason);
+  });
+}
+
 } // namespace
 
 void deduplicate_scalars(CompileGraph& graph, const CompileContext& context) {
@@ -271,6 +284,96 @@ void eliminate_split_concat(
     if (reason.empty()) {
       graph.replace_outputs({a}, {input});
       context.log_rewrite("split_concat", a, input);
+    }
+  }
+}
+
+void eliminate_concat_split(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& concat : candidates) {
+    if (!graph.contains(concat) || !concat.has_primitive()) {
+      continue;
+    }
+    auto* primitive = dynamic_cast<Concatenate*>(&concat.primitive());
+    auto uses = graph.consumers().find(concat.id());
+    if (!primitive || uses == graph.consumers().end()) {
+      continue;
+    }
+    auto consumers = uses->second;
+    if (std::none_of(consumers.begin(), consumers.end(), [](const auto& use) {
+          return dynamic_cast<Split*>(&use.first.primitive()) ||
+              dynamic_cast<Slice*>(&use.first.primitive());
+        })) {
+      continue;
+    }
+    auto axis = primitive->state();
+    auto inputs = concat.inputs();
+    Shape boundaries;
+    std::map<std::pair<int, int>, array> segments;
+    int offset = 0;
+    for (const auto& in : inputs) {
+      if (context.dimension_is(in, axis, in.shape(axis)) != ShapeCheck::True) {
+        break;
+      }
+      int end = offset + in.shape(axis);
+      boundaries.push_back(end);
+      segments.emplace(std::make_pair(offset, end), in);
+      offset = end;
+    }
+    if (boundaries.size() != inputs.size()) {
+      log_skip(context, concat, "segment_boundaries_not_proven");
+      continue;
+    }
+    boundaries.pop_back();
+    for (const auto& [node, _] : consumers) {
+      if (!graph.contains(node)) {
+        continue;
+      }
+      auto* split = dynamic_cast<Split*>(&node.primitive());
+      auto* slice = dynamic_cast<Slice*>(&node.primitive());
+      if (!split && !slice) {
+        continue;
+      }
+      if (node.primitive().stream() != primitive->stream()) {
+        log_skip(context, node, "stream_mismatch");
+        continue;
+      }
+      auto outputs = node.outputs();
+      std::vector<array> replacements;
+      if (split) {
+        auto [indices, split_axis] = split->state();
+        if (split_axis == axis && indices == boundaries) {
+          replacements = inputs;
+        }
+      } else {
+        auto [start, stop, strides] = slice->state();
+        bool full = true;
+        for (int d = 0; d < concat.ndim(); ++d) {
+          full &= strides[d] == 1 &&
+              (d == axis || (start[d] == 0 && stop[d] == concat.shape(d)));
+        }
+        auto segment = segments.find({start[axis], stop[axis]});
+        if (full && segment != segments.end()) {
+          replacements.push_back(segment->second);
+        }
+      }
+      if (replacements.size() != outputs.size() ||
+          !std::equal(
+              outputs.begin(),
+              outputs.end(),
+              replacements.begin(),
+              [&](const auto& out, const auto& in) {
+                return context.same_shape(out, in) == ShapeCheck::True;
+              })) {
+        log_skip(context, node, "segment_mapping_not_proven");
+        continue;
+      }
+      graph.replace_outputs(outputs, replacements);
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        context.log_rewrite("concat_split", outputs[i], replacements[i]);
+      }
     }
   }
 }
