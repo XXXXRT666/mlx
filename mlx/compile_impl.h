@@ -145,6 +145,20 @@ void run_compile_passes(
 
 void compile_optimize(CompileGraph& graph, const CompileContext& context);
 
+void deduplicate_scalars(CompileGraph& graph, const CompileContext& context);
+void remove_noops(CompileGraph& graph, const CompileContext& context);
+void eliminate_inverse_transposes(
+    CompileGraph& graph,
+    const CompileContext& context);
+void eliminate_roundtrip_views(
+    CompileGraph& graph,
+    const CompileContext& context);
+void eliminate_split_concat(CompileGraph& graph, const CompileContext& context);
+void eliminate_common_subexpressions(
+    CompileGraph& graph,
+    const CompileContext& context);
+void fuse_pointwise(CompileGraph& graph, const CompileContext& context);
+
 bool is_pointwise(const Primitive& primitive);
 void reorder_pointwise_views(
     CompileGraph& graph,

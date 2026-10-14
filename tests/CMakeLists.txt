@@ -30,6 +30,7 @@ target_sources(
           blas_tests.cpp
           compile_tests.cpp
           compile_reorder_tests.cpp
+          compile_simplify_tests.cpp
           custom_vjp_tests.cpp
           creations_tests.cpp
           device_tests.cpp

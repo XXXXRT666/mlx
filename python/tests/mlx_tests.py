@@ -3,6 +3,7 @@
 import contextlib
 import os
 import platform
+import subprocess
 import sys
 import unittest
 from typing import Any, Callable, List, Tuple, Union
@@ -44,6 +45,24 @@ class MLXTestRunner(unittest.TestProgram):
 
 
 class MLXTestCase(unittest.TestCase):
+    def run_compile_log_test(self, code, categories):
+        setup = """
+import os
+import sys
+import mlx.core as mx
+if "DEVICE" in os.environ:
+    mx.set_default_device(getattr(mx, os.environ["DEVICE"]))
+mx.default_stream(mx.default_device())
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", setup + code],
+            env={**os.environ, "MLX_COMPILE_LOGS": categories},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stderr
+
     @property
     def is_apple_silicon(self):
         return platform.machine() == "arm64" and platform.system() == "Darwin"
