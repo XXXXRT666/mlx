@@ -241,6 +241,69 @@ else:
             with self.assertRaisesRegex(ValueError, "infer output shapes"):
                 compiled(mx.ones((2,)), mx.ones((3,)))
 
+    def test_integer_cast_chains(self):
+        cases = (
+            (mx.int8, mx.int64, [-128, -1, 0, 127]),
+            (mx.uint8, mx.int16, [0, 127, 128, 255]),
+            (mx.int16, mx.int32, [-32768, -1, 0, 32767]),
+            (mx.uint32, mx.int64, [0, 2**31, 2**32 - 1]),
+            (mx.bool_, mx.uint64, [False, True]),
+        )
+        for dtype, via, values in cases:
+
+            def fun(x):
+                inner = x.astype(via)
+                return inner.astype(dtype), inner, inner.astype(mx.uint8)
+
+            x = mx.array(values, dtype=dtype)
+            for shapeless in (False, True):
+                compiled = mx.compile(fun, shapeless=shapeless)
+                for value in (x, x[::-1], x[:0], mx.concatenate([x, x])):
+                    self.assert_outputs(compiled(value), fun(value))
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, "casts.mlxfn")
+                    mx.export_function(path, fun, x, shapeless=shapeless)
+                    self.assert_outputs(mx.import_function(path)(x), fun(x))
+
+    def test_cast_rounding_and_signedness(self):
+        cases = (
+            (mx.int16, mx.int8, [-257, -128, 127, 256]),
+            (mx.int32, mx.uint16, [-65536, -1, 0, 65536]),
+            (mx.uint16, mx.int16, [0, 32767, 32768, 65535]),
+            (mx.int32, mx.bool_, [-1, 0, 1, 2]),
+        )
+        for dtype, via, values in cases:
+            x = mx.array(values, dtype=dtype)
+
+            def fun(x):
+                return x.astype(via).astype(dtype)
+
+            self.assert_outputs(mx.compile(fun)(x), fun(x))
+
+        x = mx.array([0.0, -0.0, 1.0003, 0.000001, float("inf"), float("nan")])
+        for via in (mx.float16, mx.bfloat16):
+
+            def fun(x):
+                return x.astype(via).astype(mx.float32)
+
+            actual, expected = mx.compile(fun)(x), fun(x)
+            self.assert_outputs(actual, expected)
+            self.assertTrue(
+                mx.array_equal(actual.view(mx.uint32)[:2], expected.view(mx.uint32)[:2])
+            )
+
+    def test_cast_chain_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+x = mx.array([-128, 127], dtype=mx.int8)
+mx.compile(lambda x: x.astype(mx.int64).astype(mx.int8))(x)
+mx.compile(lambda x: x.astype(mx.uint16).astype(mx.int8))(x)
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=redundant_cast", stderr)
+        self.assertIn("reason=lossy_or_unsupported_conversion", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

@@ -391,3 +391,54 @@ TEST_CASE("test compile concat split retains unproven mappings") {
     CHECK(array_equal(graph.outputs()[0], output).item<bool>());
   }
 }
+
+TEST_CASE("test compile lossless integer cast chains") {
+  for (auto [dtype, via] :
+       {std::pair{int8, int64},
+        {uint8, int16},
+        {int16, int32},
+        {uint16, uint32},
+        {uint32, int64},
+        {bool_, uint8}}) {
+    auto x = astype(array({-3, -1, 0, 1, 3}), dtype);
+    for (bool shapeless : {false, true}) {
+      auto inner = astype(x, via);
+      auto roundtrip = astype(inner, dtype);
+      auto graph = optimize({x}, {roundtrip, inner, roundtrip}, shapeless);
+      CHECK_EQ(graph.outputs()[0].id(), x.id());
+      CHECK_EQ(graph.outputs()[2].id(), x.id());
+      CHECK_EQ(graph.outputs()[1].dtype(), via);
+      CHECK(array_equal(graph.outputs()[1], inner).item<bool>());
+    }
+  }
+  auto x = array({-257, -128, 0, 127, 256}, int16);
+  auto output = astype(astype(astype(x, int32), int64), uint8);
+  auto graph = optimize({x}, {output});
+  CHECK_EQ(graph.outputs()[0].dtype(), uint8);
+  CHECK_EQ(graph.outputs()[0].inputs()[0].id(), x.id());
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+}
+
+TEST_CASE("test compile cast chains retain narrowing and rounding") {
+  for (auto [dtype, via] :
+       {std::pair{int8, uint16},
+        {int16, int8},
+        {uint16, int16},
+        {int32, bool_},
+        {float32, float16},
+        {float32, bfloat16},
+        {float16, float32}}) {
+    auto x = astype(array({-257.0f, -0.0f, 1.0003f, 65535.0f}), dtype);
+    auto output = astype(astype(x, via), dtype);
+    auto graph = optimize({x}, {output});
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("AsType"));
+    CHECK_EQ(graph.outputs()[0].inputs()[0].dtype(), via);
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+  auto x = array({-1, 2}, int8);
+  auto stream = new_stream(default_device());
+  auto output = astype(astype(x, int32, stream), int8);
+  auto graph = optimize({x}, {output});
+  CHECK_EQ(graph.outputs()[0].inputs()[0].dtype(), int32);
+  CHECK_EQ(graph.outputs()[0].inputs()[0].primitive().stream(), stream);
+}

@@ -33,6 +33,19 @@ struct VecU64Hash {
   }
 };
 
+bool lossless_integer_cast(Dtype from, Dtype to) {
+  if (from == bool_) {
+    return to == bool_ || issubdtype(to, integer);
+  }
+  if (!issubdtype(from, integer) || !issubdtype(to, integer)) {
+    return false;
+  }
+  bool from_signed = issubdtype(from, signedinteger);
+  bool to_signed = issubdtype(to, signedinteger);
+  return from_signed == to_signed ? from.size() <= to.size()
+                                  : !from_signed && from.size() < to.size();
+}
+
 void log_skip(
     const CompileContext& context,
     const array& node,
@@ -375,6 +388,37 @@ void eliminate_concat_split(
         context.log_rewrite("concat_split", outputs[i], replacements[i]);
       }
     }
+  }
+}
+
+void eliminate_redundant_casts(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& node : candidates) {
+    if (!graph.contains(node) ||
+        !dynamic_cast<AsType*>(node.primitive_ptr().get())) {
+      continue;
+    }
+    auto inner = node.inputs()[0];
+    if (!dynamic_cast<AsType*>(inner.primitive_ptr().get())) {
+      continue;
+    }
+    if (node.primitive().stream() != inner.primitive().stream()) {
+      log_skip(context, node, "stream_mismatch");
+      continue;
+    }
+    auto input = inner.inputs()[0];
+    if (!lossless_integer_cast(input.dtype(), inner.dtype()) ||
+        !(node.dtype() == bool_ || issubdtype(node.dtype(), integer))) {
+      log_skip(context, node, "lossy_or_unsupported_conversion");
+      continue;
+    }
+    auto output = node.dtype() == input.dtype()
+        ? input
+        : array(node.shape(), node.dtype(), node.primitive_ptr(), {input});
+    graph.replace_outputs({node}, {output});
+    context.log_rewrite("redundant_cast", node, output);
   }
 }
 

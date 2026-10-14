@@ -65,6 +65,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "eliminate_inverse_transposes",
                         "eliminate_roundtrip_views",
                         "eliminate_split_concat",
+                        "eliminate_redundant_casts",
                         "eliminate_common_subexpressions",
                         "fuse_pointwise",
                     )
