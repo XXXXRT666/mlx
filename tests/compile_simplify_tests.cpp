@@ -168,7 +168,9 @@ TEST_CASE("test compile roundtrip views") {
             graph,
             detail::CompileContext(shapeless, target, CompileMode::no_fuse));
         graph.validate();
-        CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Reshape"));
+        CHECK_EQ(
+            graph.outputs()[0].primitive().name(),
+            std::string(shape.empty() && !shapeless ? "Broadcast" : "Reshape"));
         CHECK_EQ(
             graph.outputs()[1].id() == x.id(), !shapeless || shape.empty());
         CHECK_EQ(graph.outputs()[1].id(), graph.outputs()[2].id());
@@ -441,4 +443,54 @@ TEST_CASE("test compile cast chains retain narrowing and rounding") {
   auto graph = optimize({x}, {output});
   CHECK_EQ(graph.outputs()[0].inputs()[0].dtype(), int32);
   CHECK_EQ(graph.outputs()[0].inputs()[0].primitive().stream(), stream);
+}
+
+TEST_CASE("test compile uniform pointwise values stay scalar") {
+  for (auto dtype : {float32, float16, bfloat16, int32}) {
+    auto scalar = array(3, dtype);
+    auto filled = full({2, 3}, scalar, dtype);
+    auto output = square(transpose(filled)) + full({3, 2}, array(1, dtype));
+    auto graph = optimize({scalar}, {output, filled, output});
+    CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[2].id());
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Broadcast"));
+    CHECK_EQ(graph.outputs()[0].inputs()[0].ndim(), 0);
+    CHECK_EQ(graph.outputs()[0].inputs()[0].dtype(), dtype);
+    CHECK_EQ(graph.outputs()[1].inputs()[0].id(), scalar.id());
+    for (const auto& node : graph.tape()) {
+      CHECK_FALSE(dynamic_cast<Full*>(node.primitive_ptr().get()));
+    }
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+}
+
+TEST_CASE("test compile known uniform boolean conditions") {
+  auto x = arange(6, float32);
+  auto condition =
+      logical_and(full({6}, array(true)), logical_not(full({6}, array(false))));
+  auto output = where(condition, x, negative(x));
+  auto graph = optimize({x}, {output, output});
+  CHECK_EQ(graph.outputs()[0].id(), x.id());
+  CHECK_EQ(graph.outputs()[1].id(), x.id());
+
+  auto scalar = array(true);
+  output = where(full({6}, scalar), x, negative(x));
+  graph = optimize({scalar, x}, {output});
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Select"));
+  CHECK(array_equal(graph.outputs()[0], x).item<bool>());
+}
+
+TEST_CASE("test compile uniform values retain unproven domains and streams") {
+  auto scalar = array(2.0f);
+  for (bool shapeless : {false, true}) {
+    auto output = square(full(shapeless ? Shape{4} : Shape{0}, scalar));
+    auto graph = optimize({scalar}, {output}, shapeless);
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Square"));
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+  auto stream = new_stream(default_device());
+  auto output = square(full({4}, scalar, stream));
+  auto graph = optimize({scalar}, {output});
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Square"));
+  CHECK_EQ(graph.outputs()[0].inputs()[0].primitive().stream(), stream);
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
 }

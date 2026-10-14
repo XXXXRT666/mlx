@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 
 #include <fmt/format.h>
 
 #include "mlx/compile_impl.h"
+#include "mlx/ops.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core::detail {
@@ -44,6 +46,43 @@ bool lossless_integer_cast(Dtype from, Dtype to) {
   bool to_signed = issubdtype(to, signedinteger);
   return from_signed == to_signed ? from.size() <= to.size()
                                   : !from_signed && from.size() < to.size();
+}
+
+bool preserves_uniform_value(const Primitive& p) {
+  return typeid(p) == typeid(Full) || typeid(p) == typeid(Broadcast) ||
+      typeid(p) == typeid(BroadcastAxes) || typeid(p) == typeid(Reshape) ||
+      typeid(p) == typeid(Transpose) || typeid(p) == typeid(Flatten) ||
+      typeid(p) == typeid(Unflatten) || typeid(p) == typeid(Squeeze) ||
+      typeid(p) == typeid(ExpandDims);
+}
+
+std::optional<bool> fold_boolean(
+    const Primitive& p,
+    const std::vector<std::optional<bool>>& inputs) {
+  if (!inputs[0]) {
+    return std::nullopt;
+  }
+  bool a = *inputs[0];
+  if (typeid(p) == typeid(LogicalNot)) {
+    return !a;
+  }
+  if (inputs.size() != 2 || !inputs[1]) {
+    return std::nullopt;
+  }
+  bool b = *inputs[1];
+  if (typeid(p) == typeid(LogicalAnd)) {
+    return a && b;
+  }
+  if (typeid(p) == typeid(LogicalOr)) {
+    return a || b;
+  }
+  if (typeid(p) == typeid(Equal)) {
+    return a == b;
+  }
+  if (typeid(p) == typeid(NotEqual)) {
+    return a != b;
+  }
+  return std::nullopt;
 }
 
 void log_skip(
@@ -419,6 +458,107 @@ void eliminate_redundant_casts(
         : array(node.shape(), node.dtype(), node.primitive_ptr(), {input});
     graph.replace_outputs({node}, {output});
     context.log_rewrite("redundant_cast", node, output);
+  }
+}
+
+void fold_uniform_values(CompileGraph& graph, const CompileContext& context) {
+  std::unordered_map<uintptr_t, array> scalars;
+  std::unordered_set<uintptr_t> input_ids;
+  for (const auto& input : graph.inputs()) {
+    input_ids.insert(input.id());
+  }
+  auto uniform = [&](const array& a) -> std::optional<array> {
+    if (auto it = scalars.find(a.id()); it != scalars.end()) {
+      return it->second;
+    }
+    return a.ndim() == 0 ? std::optional<array>(a) : std::nullopt;
+  };
+  auto boolean = [&](const array& a) -> std::optional<bool> {
+    if (a.dtype() == bool_ && a.is_available() && !a.has_primitive() &&
+        !input_ids.contains(a.id())) {
+      return *a.data<bool>();
+    }
+    return std::nullopt;
+  };
+
+  auto candidates = graph.tape();
+  for (const auto& node : candidates) {
+    if (!graph.contains(node) || !node.has_primitive() ||
+        node.inputs().empty() || input_ids.contains(node.id())) {
+      continue;
+    }
+    auto first = uniform(node.inputs()[0]);
+    if (!first) {
+      continue;
+    }
+    auto& p = node.primitive();
+    bool preserves = preserves_uniform_value(p);
+    if (!preserves && !is_pointwise(p)) {
+      continue;
+    }
+    if (std::any_of(
+            node.inputs().begin(), node.inputs().end(), [&](const auto& in) {
+              return in.has_primitive() &&
+                  in.primitive().stream() != p.stream();
+            })) {
+      log_skip(context, node, "stream_mismatch");
+      continue;
+    }
+    if (typeid(p) == typeid(Broadcast) && node.inputs().size() == 1 &&
+        node.inputs()[0].ndim() == 0) {
+      scalars.emplace(node.id(), *first);
+      continue;
+    }
+    if (context.size_at_most(*first, node) != ShapeCheck::True) {
+      log_skip(context, node, "nonempty_shape_not_proven");
+      continue;
+    }
+    if (typeid(p) == typeid(Select)) {
+      if (auto condition = boolean(*first)) {
+        auto selected = node.inputs()[*condition ? 1 : 2];
+        if (context.same_shape(node, selected) == ShapeCheck::True) {
+          graph.replace_outputs({node}, {selected});
+          context.log_rewrite("uniform_select", node, selected);
+          continue;
+        }
+      }
+    }
+    std::vector<array> inputs{*first};
+    if (!preserves) {
+      for (size_t i = 1; i < node.inputs().size(); ++i) {
+        auto scalar = uniform(node.inputs()[i]);
+        if (!scalar) {
+          break;
+        }
+        inputs.push_back(*scalar);
+      }
+      if (inputs.size() != node.inputs().size()) {
+        continue;
+      }
+    }
+    auto scalar = *first;
+    if (!preserves) {
+      std::optional<bool> folded;
+      if (node.dtype() == bool_) {
+        std::vector<std::optional<bool>> values;
+        for (const auto& in : inputs) {
+          values.push_back(boolean(in));
+        }
+        folded = fold_boolean(p, values);
+      }
+      if (folded) {
+        scalar = array(*folded);
+      } else if (node.ndim() == 0) {
+        continue;
+      } else {
+        scalar =
+            array({}, node.dtype(), node.primitive_ptr(), std::move(inputs));
+      }
+    }
+    auto output = broadcast_to(scalar, node.shape(), p.stream());
+    graph.replace_outputs({node}, {output});
+    scalars.insert_or_assign(output.id(), scalar);
+    context.log_rewrite("uniform_value", node, output);
   }
 }
 

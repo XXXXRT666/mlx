@@ -74,6 +74,7 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
       {"eliminate_redundant_casts",
        eliminate_redundant_casts,
        PassScope::CompileAndExport},
+      {"fold_uniform_values", fold_uniform_values, PassScope::CompileAndExport},
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,
        PassScope::CompileAndExport},

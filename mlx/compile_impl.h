@@ -161,6 +161,7 @@ void eliminate_concat_split(CompileGraph& graph, const CompileContext& context);
 void eliminate_redundant_casts(
     CompileGraph& graph,
     const CompileContext& context);
+void fold_uniform_values(CompileGraph& graph, const CompileContext& context);
 void fuse_pointwise(CompileGraph& graph, const CompileContext& context);
 
 bool is_pointwise(const Primitive& primitive);

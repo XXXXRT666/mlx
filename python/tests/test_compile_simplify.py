@@ -304,6 +304,107 @@ mx.compile(lambda x: x.astype(mx.uint16).astype(mx.int8))(x)
         self.assertIn("event=rewrite rule=redundant_cast", stderr)
         self.assertIn("reason=lossy_or_unsupported_conversion", stderr)
 
+    def test_uniform_values(self):
+        def fun(s):
+            filled = mx.full((2, 3), s)
+            value = mx.square(filled.T).astype(mx.float32) + mx.ones((3, 2))
+            return value, filled, value
+
+        for dtype in (mx.float32, mx.float16, mx.bfloat16, mx.int32):
+            compiled = mx.compile(fun)
+            for value in (2, -3, 0):
+                s = mx.array(value, dtype=dtype)
+                self.assert_outputs(compiled(s), fun(s))
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "uniform.mlxfn")
+                mx.export_function(path, fun, s)
+                s = mx.array(7, dtype=dtype)
+                self.assert_outputs(mx.import_function(path)(s), fun(s))
+
+        def loss(s):
+            return mx.sum(fun(s)[0])
+
+        s = mx.array(2.0)
+        for grad in (mx.grad(mx.compile(loss)), mx.compile(mx.grad(loss))):
+            self.assert_outputs(grad(s), mx.grad(loss)(s))
+        batch = mx.array([2.0, -3.0, 0.0])
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            self.assert_outputs(mapped(batch), mx.vmap(fun)(batch))
+
+    def test_uniform_boolean_conditions(self):
+        x = mx.arange(6, dtype=mx.int16)
+        y = mx.array(2.5)
+
+        def fun(x, y):
+            condition = mx.logical_and(
+                mx.full((6,), True), mx.logical_not(mx.full((6,), False))
+            )
+            return mx.where(condition, x, y), mx.where(
+                mx.not_equal(condition, True), x, y
+            )
+
+        self.assert_outputs(mx.compile(fun)(x, y), fun(x, y))
+
+        def runtime_condition(s, x, y):
+            return mx.where(mx.full((6,), s), x, y)
+
+        compiled = mx.compile(runtime_condition)
+        for condition in (True, False):
+            s = mx.array(condition)
+            self.assert_outputs(compiled(s, x, y), runtime_condition(s, x, y))
+
+        def rounded_condition(x, y):
+            condition = mx.full((6,), 1e-20).astype(mx.float16)
+            return mx.where(condition, x, y)
+
+        self.assert_outputs(
+            mx.compile(rounded_condition)(x, y), rounded_condition(x, y)
+        )
+
+    def test_uniform_numerics_and_shapeless_validation(self):
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+
+            def fun(s):
+                return mx.negative(mx.full((8,), s).astype(dtype)).astype(mx.float32)
+
+            compiled = mx.compile(fun)
+            for value in (0.0, -0.0, 1.0003, float("inf"), float("nan")):
+                s = mx.array(value)
+                actual, expected = compiled(s), fun(s)
+                self.assert_outputs(actual, expected)
+                if value == 0:
+                    self.assert_outputs(
+                        actual.view(mx.uint32), expected.view(mx.uint32)
+                    )
+
+        def empty(s):
+            return mx.square(mx.full((0, 3), s))
+
+        self.assert_outputs(mx.compile(empty)(mx.array(2.0)), mx.zeros((0, 3)))
+
+        def guarded(x, y):
+            return mx.where(mx.full((4,), False), x.reshape(2, -1).reshape(-1), y)
+
+        compiled = mx.compile(guarded, shapeless=True)
+        self.assert_outputs(compiled(mx.arange(4), mx.ones(4)), mx.ones(4))
+        with self.assertRaises(ValueError):
+            compiled(mx.arange(5), mx.ones(4))
+
+    def test_uniform_value_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+x = mx.arange(4)
+mx.compile(lambda x: mx.where(mx.full((4,), True), x, -x))(x)
+fun = lambda s: mx.square(mx.full((4,), s))
+mx.compile(fun)(mx.array(2.0))
+mx.compile(fun, shapeless=True)(mx.array(2.0))
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=uniform_value", stderr)
+        self.assertIn("event=rewrite rule=uniform_select", stderr)
+        self.assertIn("reason=nonempty_shape_not_proven", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
