@@ -467,6 +467,87 @@ mx.compile(shared)(a, b)
         self.assertIn("event=rewrite rule=concatenate_slices", stderr)
         self.assertIn("reason=concat_not_removable", stderr)
 
+    def test_integer_algebraic_identities(self):
+        for dtype in (
+            mx.int8,
+            mx.uint8,
+            mx.int16,
+            mx.uint16,
+            mx.int32,
+            mx.uint32,
+            mx.int64,
+            mx.uint64,
+        ):
+
+            def fun(x):
+                zero = mx.zeros(x.shape, dtype=dtype)
+                one = mx.ones(x.shape, dtype=dtype)
+                return (x + zero) * one - zero, zero + x, one * x
+
+            x = mx.array([-1, 0, 1, 127]).astype(dtype)
+            compiled = mx.compile(fun)
+            for value in (x, x[::-1], x[:0]):
+                self.assert_outputs(compiled(value), fun(value))
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "identities.mlxfn")
+                mx.export_function(path, fun, x)
+                self.assert_outputs(mx.import_function(path)(x), fun(x))
+
+        def promoted(x):
+            return x + mx.zeros((2, 3), dtype=mx.int32)
+
+        x = mx.array([[1], [2]], dtype=mx.int16)
+        self.assert_outputs(mx.compile(promoted)(x), promoted(x))
+
+    def test_boolean_algebraic_identities(self):
+        def fun(x):
+            return (
+                mx.logical_and(x, mx.ones((2, 3), dtype=mx.bool_)),
+                mx.logical_or(mx.zeros((2, 3), dtype=mx.bool_), x),
+            )
+
+        x = mx.array([[True], [False]])
+        self.assert_outputs(mx.compile(fun)(x), fun(x))
+        batch = mx.stack([x, mx.logical_not(x)])
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            self.assert_outputs(mapped(batch), mx.vmap(fun)(batch))
+
+    def test_algebraic_identity_runtime_values_and_floats(self):
+        traces = []
+
+        def fun(x, s):
+            traces.append(1)
+            return x + s, x * s, s - x
+
+        x = mx.arange(4)
+        compiled = mx.compile(fun)
+        for scalar in (0, 1, 2, -1):
+            s = mx.array(scalar)
+            self.assert_outputs(compiled(x, s), (x + s, x * s, s - x))
+        self.assertEqual(len(traces), 1)
+
+        def floating(x):
+            return x + 0.0, x * 1.0, x * 0.0
+
+        x = mx.array([-0.0, 0.0, float("inf"), float("nan")])
+        for actual, expected in zip(mx.compile(floating)(x), floating(x)):
+            self.assert_outputs(actual, expected)
+            self.assert_outputs(
+                actual[:2].view(mx.uint32), expected[:2].view(mx.uint32)
+            )
+
+    def test_algebraic_identity_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+x = mx.arange(4)
+mx.compile(lambda x: (x + 0) * 1)(x)
+mx.compile(lambda x: x + 0, shapeless=True)(x)
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=algebraic_identity", stderr)
+        self.assertIn("reason=constant_value_not_proven", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

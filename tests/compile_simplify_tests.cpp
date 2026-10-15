@@ -555,3 +555,61 @@ TEST_CASE("test compile combine concatenation slices guards") {
     CHECK(array_equal(graph.outputs()[0], output).item<bool>());
   }
 }
+
+TEST_CASE("test compile integer algebraic identities") {
+  for (auto dtype :
+       {int8, uint8, int16, uint16, int32, uint32, int64, uint64}) {
+    auto x = array({-1, 0, 1, 127}, dtype);
+    auto zero = full(x.shape(), array(0), dtype);
+    auto one = full(x.shape(), array(1), dtype);
+    auto graph = optimize({x}, {(x + zero) * one - zero, zero + x, one * x});
+    for (const auto& output : graph.outputs()) {
+      CHECK_EQ(output.id(), x.id());
+    }
+  }
+  auto x = reshape(arange(2, int16), {2, 1});
+  auto output = x + zeros({2, 3}, int32);
+  auto graph = optimize({x}, {output});
+  CHECK_EQ(graph.outputs()[0].dtype(), int32);
+  CHECK_EQ(graph.outputs()[0].shape(), (Shape{2, 3}));
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+}
+
+TEST_CASE("test compile boolean algebraic identities") {
+  auto x = array({true, false, true});
+  auto one = full({3}, array(true));
+  auto zero = full({3}, array(false));
+  auto graph = optimize(
+      {x},
+      {logical_and(x, one),
+       logical_and(one, x),
+       logical_or(x, zero),
+       logical_or(zero, x)});
+  for (const auto& output : graph.outputs()) {
+    CHECK_EQ(output.id(), x.id());
+  }
+}
+
+TEST_CASE("test compile algebraic identity guards") {
+  auto x = array({1, 2, 3});
+  auto scalar = array(0);
+  auto output = x + scalar;
+  auto graph = optimize({x, scalar}, {output});
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Add"));
+  graph = optimize({x}, {x + array(0)}, true);
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Add"));
+  graph = optimize({x}, {array(0) - x});
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Subtract"));
+
+  auto stream = new_stream(default_device());
+  output = astype(x, int64, stream) + array(0, int64);
+  graph = optimize({x}, {output});
+  CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Add"));
+  for (auto dtype : {float16, bfloat16, float32}) {
+    auto input = array({-0.0f, 1.0f}, dtype);
+    graph =
+        optimize({input}, {input + array(0, dtype), input * array(1, dtype)});
+    CHECK_EQ(graph.outputs()[0].primitive().name(), std::string("Add"));
+    CHECK_EQ(graph.outputs()[1].primitive().name(), std::string("Multiply"));
+  }
+}

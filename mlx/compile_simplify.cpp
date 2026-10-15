@@ -85,6 +85,48 @@ std::optional<bool> fold_boolean(
   return std::nullopt;
 }
 
+bool is_identity_constant(
+    array scalar,
+    uint64_t value,
+    const std::unordered_set<uintptr_t>& input_ids,
+    Stream stream) {
+  while (scalar.has_primitive()) {
+    if (input_ids.contains(scalar.id()) ||
+        scalar.primitive().stream() != stream) {
+      return false;
+    }
+    auto& p = scalar.primitive();
+    auto integral = [](Dtype dtype) {
+      return dtype == bool_ || issubdtype(dtype, integer);
+    };
+    bool broadcast = typeid(p) == typeid(Broadcast) &&
+        scalar.inputs().size() == 1 && scalar.inputs()[0].ndim() == 0;
+    // Zero and one are exact through integer and bool casts.
+    bool cast = typeid(p) == typeid(AsType) && scalar.ndim() == 0 &&
+        integral(scalar.dtype()) && integral(scalar.inputs()[0].dtype());
+    if (!broadcast && !cast) {
+      return false;
+    }
+    scalar = scalar.inputs()[0];
+  }
+  if (scalar.ndim() != 0 || !scalar.is_available() ||
+      input_ids.contains(scalar.id()) ||
+      !(scalar.dtype() == bool_ || issubdtype(scalar.dtype(), integer))) {
+    return false;
+  }
+  switch (scalar.itemsize()) {
+    case 1:
+      return *scalar.data<uint8_t>() == value;
+    case 2:
+      return *scalar.data<uint16_t>() == value;
+    case 4:
+      return *scalar.data<uint32_t>() == value;
+    case 8:
+      return *scalar.data<uint64_t>() == value;
+  }
+  return false;
+}
+
 void log_skip(
     const CompileContext& context,
     const array& node,
@@ -674,6 +716,53 @@ void fold_uniform_values(CompileGraph& graph, const CompileContext& context) {
     graph.replace_outputs({node}, {output});
     scalars.insert_or_assign(output.id(), scalar);
     context.log_rewrite("uniform_value", node, output);
+  }
+}
+
+void eliminate_algebraic_identities(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  std::unordered_set<uintptr_t> input_ids;
+  for (const auto& input : graph.inputs()) {
+    input_ids.insert(input.id());
+  }
+  auto candidates = graph.tape();
+  for (const auto& node : candidates) {
+    if (!graph.contains(node) || !node.has_primitive() ||
+        node.inputs().size() != 2) {
+      continue;
+    }
+    auto& p = node.primitive();
+    bool one = typeid(p) == typeid(Multiply) || typeid(p) == typeid(LogicalAnd);
+    bool subtract = typeid(p) == typeid(Subtract);
+    bool arithmetic = issubdtype(node.dtype(), integer) &&
+        (typeid(p) == typeid(Add) || subtract || typeid(p) == typeid(Multiply));
+    bool logical = node.dtype() == bool_ &&
+        (typeid(p) == typeid(LogicalAnd) || typeid(p) == typeid(LogicalOr));
+    if (!arithmetic && !logical) {
+      continue;
+    }
+    int retained = -1;
+    if (is_identity_constant(node.inputs()[1], one, input_ids, p.stream())) {
+      retained = 0;
+    } else if (
+        !subtract &&
+        is_identity_constant(node.inputs()[0], one, input_ids, p.stream())) {
+      retained = 1;
+    }
+    if (retained < 0) {
+      log_skip(context, node, "constant_value_not_proven");
+      continue;
+    }
+    auto output = node.inputs()[retained];
+    if (output.has_primitive() && output.primitive().stream() != p.stream()) {
+      log_skip(context, node, "stream_mismatch");
+    } else if (context.same_shape(node, output) != ShapeCheck::True) {
+      log_skip(context, node, "shape_not_proven");
+    } else {
+      graph.replace_outputs({node}, {output});
+      context.log_rewrite("algebraic_identity", node, output);
+    }
   }
 }
 
