@@ -158,6 +158,9 @@ void eliminate_common_subexpressions(
     CompileGraph& graph,
     const CompileContext& context);
 void eliminate_concat_split(CompileGraph& graph, const CompileContext& context);
+void combine_concatenate_slices(
+    CompileGraph& graph,
+    const CompileContext& context);
 void eliminate_redundant_casts(
     CompileGraph& graph,
     const CompileContext& context);

@@ -494,3 +494,64 @@ TEST_CASE("test compile uniform values retain unproven domains and streams") {
   CHECK_EQ(graph.outputs()[0].inputs()[0].primitive().stream(), stream);
   CHECK(array_equal(graph.outputs()[0], output).item<bool>());
 }
+
+TEST_CASE("test compile combine concatenation slices") {
+  auto a = reshape(arange(6, float32), {2, 3});
+  auto empty = zeros({2, 0});
+  auto b = reshape(arange(8, float32), {2, 4});
+  for (int start = 0; start <= 7; ++start) {
+    for (int stop = start; stop <= 7; ++stop) {
+      auto joined = concatenate({a, empty, b}, 1);
+      auto part = slice(joined, {0, start}, {2, stop});
+      auto output = concatenate({part, joined, joined, part}, 1);
+      auto graph = optimize({a, empty, b}, {output, output});
+      CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[1].id());
+      int concats = 0;
+      for (const auto& node : graph.tape()) {
+        concats +=
+            dynamic_cast<Concatenate*>(node.primitive_ptr().get()) != nullptr;
+      }
+      CHECK_EQ(concats, 1);
+      CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test compile combine concatenation slices preserves promotion") {
+  auto a = array({16777217, -16777217}, int32);
+  auto b = array({1.5f, 2.5f, 3.5f});
+  auto joined = concatenate({a, b});
+  auto output = concatenate({joined, slice(joined, {1}, {4})});
+  auto graph = optimize({a, b}, {output});
+  CHECK_EQ(graph.outputs()[0].dtype(), float32);
+  CHECK_EQ(
+      graph.outputs()[0].inputs()[0].primitive().name(), std::string("AsType"));
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+}
+
+TEST_CASE("test compile combine concatenation slices guards") {
+  auto a = arange(3, float32);
+  auto b = arange(4, float32);
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 5; ++variant) {
+    auto joined = concatenate({a, b});
+    auto part = slice(
+        joined,
+        {1},
+        {5},
+        {variant == 2 ? 2 : 1},
+        variant == 3 ? stream : default_stream(default_device()));
+    auto output = concatenate({joined, part});
+    std::vector<array> outputs{output};
+    if (variant == 0) {
+      outputs.push_back(joined);
+    } else if (variant == 1) {
+      outputs.push_back(part);
+    }
+    auto graph = optimize({a, b}, outputs, variant == 4);
+    CHECK_EQ(
+        graph.outputs()[0].inputs()[0].primitive().name(),
+        std::string("Concatenate"));
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+}

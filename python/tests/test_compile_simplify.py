@@ -405,6 +405,68 @@ mx.compile(fun, shapeless=True)(mx.array(2.0))
         self.assertIn("event=rewrite rule=uniform_select", stderr)
         self.assertIn("reason=nonempty_shape_not_proven", stderr)
 
+    def test_combine_concatenate_slices(self):
+        for start, stop in ((0, 2), (1, 5), (3, 7), (0, 7), (2, 2)):
+
+            def fun(a, b):
+                joined = mx.concatenate([a, b], axis=1)
+                part = joined[:, start:stop]
+                output = mx.concatenate([part, joined, joined, part], axis=1)
+                return output, output
+
+            compiled = mx.compile(fun)
+            for dtype in (mx.int32, mx.float32, mx.float16, mx.bfloat16):
+                a = mx.arange(12).reshape(2, 6)[:, ::2].astype(dtype)
+                b = mx.arange(8).reshape(2, 4)[:, ::-1].astype(dtype)
+                self.assert_outputs(compiled(a, b), fun(a, b))
+            a = mx.array([[16777217, -16777217, 3]], dtype=mx.int32)
+            b = mx.array([[0.5, 1.5, 2.5, 3.5]])
+            self.assert_outputs(compiled(a, b), fun(a, b))
+
+    def test_combine_concatenate_slices_transforms_and_export(self):
+        def fun(a, b):
+            joined = mx.concatenate([a, b], axis=-1)
+            return mx.concatenate([joined, joined[..., 1:5]], axis=-1)
+
+        a = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+        b = mx.arange(8, dtype=mx.float32).reshape(2, 4)
+
+        def loss(a, b):
+            return mx.sum(mx.square(fun(a, b)))
+
+        for grad in (
+            mx.grad(mx.compile(loss), argnums=(0, 1)),
+            mx.compile(mx.grad(loss, argnums=(0, 1))),
+        ):
+            self.assert_outputs(grad(a, b), mx.grad(loss, argnums=(0, 1))(a, b))
+        batch_a, batch_b = mx.stack([a, a + 1]), mx.stack([b, b + 1])
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            self.assert_outputs(
+                mapped(batch_a, batch_b), mx.vmap(fun)(batch_a, batch_b)
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "concat_slices.mlxfn")
+            mx.export_function(path, fun, a, b)
+            self.assert_outputs(mx.import_function(path)(a, b), fun(a, b))
+
+    def test_combine_concatenate_slices_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+a, b = mx.arange(3), mx.arange(4)
+def fun(a, b):
+    joined = mx.concatenate([a, b])
+    return mx.concatenate([joined, joined[1:5]])
+mx.compile(fun)(a, b)
+def shared(a, b):
+    joined = mx.concatenate([a, b])
+    return mx.concatenate([joined, joined[1:5]]), joined
+mx.compile(shared)(a, b)
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=concatenate_slices", stderr)
+        self.assertIn("reason=concat_not_removable", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

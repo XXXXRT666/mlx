@@ -461,6 +461,121 @@ void eliminate_redundant_casts(
   }
 }
 
+void combine_concatenate_slices(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  // Visit consumers first to avoid repeatedly expanding new input lists.
+  std::reverse(candidates.begin(), candidates.end());
+  for (const auto& node : candidates) {
+    auto* concat = dynamic_cast<Concatenate*>(node.primitive_ptr().get());
+    if (!graph.contains(node) || !concat) {
+      continue;
+    }
+    auto axis = concat->state();
+    auto stream = concat->stream();
+    std::unordered_map<uintptr_t, std::vector<array>> replacements;
+    for (const auto& input : node.inputs()) {
+      auto* inner = dynamic_cast<Concatenate*>(input.primitive_ptr().get());
+      if (!inner || inner->state() != axis ||
+          replacements.contains(input.id())) {
+        continue;
+      }
+      if (inner->stream() != stream) {
+        log_skip(context, input, "stream_mismatch");
+        continue;
+      }
+      std::vector<array> slices;
+      bool exclusive = !graph.is_output(input);
+      for (const auto& [use, _] : graph.consumers().at(input.id())) {
+        if (use.id() == node.id()) {
+          continue;
+        }
+        auto* selection = dynamic_cast<Slice*>(use.primitive_ptr().get());
+        if (!selection || selection->stream() != stream ||
+            graph.is_output(use) ||
+            std::any_of(
+                graph.consumers().at(use.id()).begin(),
+                graph.consumers().at(use.id()).end(),
+                [&](const auto& consumer) {
+                  return consumer.first.id() != node.id();
+                })) {
+          exclusive = false;
+          break;
+        }
+        auto [start, stop, strides] = selection->state();
+        for (int d = 0; d < input.ndim(); ++d) {
+          exclusive &= strides[d] == 1 &&
+              (d == axis || (start[d] == 0 && stop[d] == input.shape(d)));
+        }
+        exclusive &= 0 <= start[axis] && start[axis] <= stop[axis] &&
+            stop[axis] <= input.shape(axis);
+        slices.push_back(use);
+      }
+      if (!exclusive) {
+        log_skip(context, input, "concat_not_removable");
+        continue;
+      }
+      bool proven = true;
+      for (int d = 0; d < input.ndim(); ++d) {
+        proven &=
+            context.dimension_is(input, d, input.shape(d)) == ShapeCheck::True;
+      }
+      Shape boundaries{0};
+      for (const auto& part : input.inputs()) {
+        proven &= context.dimension_is(part, axis, part.shape(axis)) ==
+            ShapeCheck::True;
+        boundaries.push_back(boundaries.back() + part.shape(axis));
+      }
+      if (!proven) {
+        log_skip(context, input, "segment_boundaries_not_proven");
+        continue;
+      }
+      replacements.emplace(input.id(), input.inputs());
+      for (const auto& selection : slices) {
+        if (replacements.contains(selection.id())) {
+          continue;
+        }
+        auto [start, stop, strides] =
+            static_cast<Slice&>(selection.primitive()).state();
+        auto& parts = replacements[selection.id()];
+        auto first =
+            std::upper_bound(boundaries.begin(), boundaries.end(), start[axis]);
+        size_t i = first - boundaries.begin() - 1;
+        for (; i < input.inputs().size() && boundaries[i] < stop[axis]; ++i) {
+          const auto& part = input.inputs()[i];
+          auto begin = std::max(start[axis], boundaries[i]) - boundaries[i];
+          auto end = std::min(stop[axis], boundaries[i + 1]) - boundaries[i];
+          if (begin == end) {
+            continue;
+          }
+          Shape part_start(part.ndim(), 0);
+          auto part_stop = part.shape();
+          part_start[axis] = begin;
+          part_stop[axis] = end;
+          parts.push_back(slice(part, part_start, part_stop, stream));
+        }
+      }
+    }
+    if (replacements.empty()) {
+      continue;
+    }
+    std::vector<array> inputs;
+    for (const auto& input : node.inputs()) {
+      if (auto it = replacements.find(input.id()); it != replacements.end()) {
+        inputs.insert(inputs.end(), it->second.begin(), it->second.end());
+      } else {
+        inputs.push_back(input);
+      }
+    }
+    auto output = concatenate(std::move(inputs), axis, stream);
+    if (context.same_shape(node, output) == ShapeCheck::True) {
+      graph.replace_outputs({node}, {output});
+      context.log_rewrite("concatenate_slices", node, output);
+    }
+  }
+}
+
 void fold_uniform_values(CompileGraph& graph, const CompileContext& context) {
   std::unordered_map<uintptr_t, array> scalars;
   std::unordered_set<uintptr_t> input_ids;

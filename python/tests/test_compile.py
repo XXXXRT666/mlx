@@ -61,6 +61,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "reorder_pointwise_views",
                         "reorder_pointwise_selections",
                         "eliminate_concat_split",
+                        "combine_concatenate_slices",
                         "reorder_pointwise_concatenations",
                         "eliminate_inverse_transposes",
                         "eliminate_roundtrip_views",
