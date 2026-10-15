@@ -4,6 +4,8 @@ import gc
 import inspect
 import io
 import math
+import os
+import tempfile
 import threading
 from functools import partial, wraps
 from io import StringIO
@@ -15,6 +17,125 @@ import numpy as np
 
 
 class TestCompile(mlx_tests.MLXTestCase):
+    def test_horizontal_pointwise_outputs(self):
+        def fun(x):
+            a, b = mx.sin(x), mx.cos(x)
+            return b, a, a, x
+
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            compiled = mx.compile(fun)
+            tolerance = 1e-5 if dtype == mx.float32 else 1e-2
+            for x in (
+                mx.arange(12).reshape(3, 4).T,
+                mx.arange(24).reshape(4, 6)[:, ::-2],
+                mx.zeros((0, 4)),
+                mx.array(0.5),
+            ):
+                x = (x.astype(dtype) * 0.1).astype(dtype)
+                for actual, expected in zip(compiled(x), fun(x)):
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertTrue(
+                        mx.allclose(actual, expected, atol=tolerance, rtol=tolerance)
+                    )
+
+    def test_horizontal_pointwise_shared_and_mixed_outputs(self):
+        def fun(x, y):
+            shared = x * y
+            return (
+                mx.sin(shared),
+                mx.cos(shared),
+                shared > 0,
+                shared.astype(mx.int16),
+                shared,
+            )
+
+        compiled = mx.compile(fun)
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            x = mx.array([-0.5, 0.25, 1.0, 2.0], dtype=dtype)
+            y = mx.array([2.0, 0.5, -1.0, 0.25], dtype=dtype)
+            for actual, expected in zip(compiled(x, y), fun(x, y)):
+                self.assertEqual(actual.dtype, expected.dtype)
+                self.assertTrue(mx.allclose(actual, expected, atol=1e-2, rtol=1e-2))
+        x = mx.array([1 + 2j, -3 + 0.5j], dtype=mx.complex64)
+
+        def complex_fun(x):
+            return mx.negative(x), mx.conjugate(x)
+
+        for actual, expected in zip(mx.compile(complex_fun)(x), complex_fun(x)):
+            self.assertTrue(mx.array_equal(actual, expected))
+
+    def test_horizontal_pointwise_transforms_and_export(self):
+        def fun(x):
+            return mx.sin(x), mx.cos(x)
+
+        x = mx.arange(8, dtype=mx.float32).reshape(2, 4) * 0.1
+
+        def loss(x):
+            return sum(mx.sum(a) for a in fun(x))
+
+        compiled = mx.compile(fun)
+        mx.eval(compiled(x))
+        cached_grad = mx.grad(lambda x: sum(mx.sum(a) for a in compiled(x)))
+        self.assertTrue(
+            mx.allclose(cached_grad(x), mx.grad(loss)(x), atol=1e-5, rtol=1e-5)
+        )
+        for grad in (mx.grad(mx.compile(loss)), mx.compile(mx.grad(loss))):
+            self.assertTrue(
+                mx.allclose(grad(x), mx.grad(loss)(x), atol=1e-5, rtol=1e-5)
+            )
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            for actual, expected in zip(mapped(x), mx.vmap(fun)(x)):
+                self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+        values, tangents = mx.jvp(mx.compile(fun), [x], [mx.ones_like(x)])
+        for actual, expected in zip(
+            [*values, *tangents], [*fun(x), mx.cos(x), -mx.sin(x)]
+        ):
+            self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "horizontal.mlxfn")
+            mx.export_function(path, fun, x)
+            for actual, expected in zip(mx.import_function(path)(x), fun(x)):
+                self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+
+    def test_horizontal_pointwise_shapeless_and_layouts(self):
+        def fun(x):
+            return mx.sin(x), mx.cos(x.T), mx.sin(x.T)
+
+        for shapeless in (False, True):
+            compiled = mx.compile(fun, shapeless=shapeless)
+            for shape in ((2, 2), (2, 3), (3, 4)):
+                x = mx.arange(math.prod(shape), dtype=mx.float32).reshape(shape)[
+                    :, ::-1
+                ]
+                for actual, expected in zip(compiled(x), fun(x)):
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+
+    def test_horizontal_pointwise_logs_and_dispatch(self):
+        stderr = self.run_compile_log_test(
+            """
+x = mx.array([0.25, 0.5, 1.0, 2.0])
+y = mx.array([1.0, 2.0, 3.0, 4.0])
+def fun(x, y):
+    return mx.sin(x) * y, mx.cos(x) * y
+outputs = mx.compile(fun)(x, y)
+print("before_eval", file=sys.stderr)
+mx.eval(outputs)
+mx.synchronize()
+for actual, expected in zip(outputs, fun(x, y)):
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+mx.compile(lambda x: (mx.sin(x), mx.cos(x)), shapeless=True)(x)
+""",
+            "passes,fusion,codegen",
+        )
+        self.assertIn("event=rewrite rule=horizontal_pointwise_region", stderr)
+        self.assertIn("reason=output_shape_not_proven", stderr)
+        before, after = stderr.split("before_eval\n")
+        self.assertNotIn("event=dispatch", before)
+        if mx.default_device() == mx.gpu:
+            self.assertEqual(after.count("backend=metal event=dispatch"), 1)
+
     def test_compile_logs(self):
         code = """
 traces = []
@@ -70,10 +191,11 @@ assert mx.array_equal(first[::-1], second).item()
                         "fold_uniform_values",
                         "eliminate_algebraic_identities",
                         "eliminate_common_subexpressions",
+                        "fuse_horizontal_pointwise",
                         "fuse_pointwise",
                     )
                     self.assertEqual(len(passes), len(pass_names))
-                    self.assertEqual(len(export), len(pass_names) - 1)
+                    self.assertEqual(len(export), len(pass_names) - 2)
                     for lines in (passes, export):
                         for name, line in zip(pass_names, lines):
                             self.assertIn(f"pass={name} ", line)

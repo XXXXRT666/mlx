@@ -15,6 +15,97 @@
 
 using namespace mlx::core;
 
+namespace {
+
+detail::CompileGraph optimize_fusion(
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs,
+    bool shapeless = false,
+    CompileMode mode = CompileMode::enabled) {
+  eval(inputs);
+  detail::CompileGraph graph(inputs, outputs, {});
+  detail::compile_optimize(
+      graph,
+      detail::CompileContext(shapeless, detail::CompileTarget::Compile, mode));
+  graph.validate();
+  return graph;
+}
+
+} // namespace
+
+TEST_CASE("test compile horizontal pointwise outputs") {
+  for (const Shape& shape : {Shape{}, Shape{8}, Shape{2, 4}, Shape{0, 4}}) {
+    auto x = full(shape, array(0.5f));
+    auto sine = sin(x);
+    auto cosine = cos(x);
+    auto graph = optimize_fusion({x}, {cosine, sine, sine, x});
+    REQUIRE(dynamic_cast<Compiled*>(graph.outputs()[0].primitive_ptr().get()));
+    CHECK_EQ(
+        graph.outputs()[0].primitive_id(), graph.outputs()[1].primitive_id());
+    CHECK_EQ(graph.outputs()[1].id(), graph.outputs()[2].id());
+    CHECK_EQ(graph.outputs()[3].id(), x.id());
+    CHECK(allclose(graph.outputs()[0], cosine).item<bool>());
+    CHECK(allclose(graph.outputs()[1], sine).item<bool>());
+  }
+}
+
+TEST_CASE("test compile horizontal fusion shares producers and output types") {
+  auto x = array({-0.5f, 0.25f, 1.0f, 2.0f});
+  auto shared = exp(x);
+  std::vector<array> outputs{
+      sin(shared), cos(shared), greater(shared, array(1.0f)), shared};
+  auto graph = optimize_fusion({x}, outputs);
+  REQUIRE(dynamic_cast<Compiled*>(graph.outputs()[0].primitive_ptr().get()));
+  for (const auto& output : graph.outputs()) {
+    CHECK_EQ(output.primitive_id(), graph.outputs()[0].primitive_id());
+  }
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    CHECK_EQ(graph.outputs()[i].dtype(), outputs[i].dtype());
+    CHECK(allclose(graph.outputs()[i], outputs[i], 1e-5, 1e-5).item<bool>());
+  }
+}
+
+TEST_CASE("test compile horizontal fusion guards") {
+  auto x = array({-0.5f, 0.25f, 1.0f, 2.0f});
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 4; ++variant) {
+    auto sine = sin(x);
+    auto cosine =
+        cos(x, variant == 0 ? stream : default_stream(default_device()));
+    std::vector<array> outputs{sine, cosine};
+    if (variant == 1) {
+      outputs.push_back(sum(sine));
+    }
+    auto graph = optimize_fusion(
+        {x},
+        outputs,
+        variant == 2,
+        variant == 3 ? CompileMode::no_fuse : CompileMode::enabled);
+    CHECK_FALSE(
+        dynamic_cast<Compiled*>(graph.outputs()[0].primitive_ptr().get()));
+    CHECK_FALSE(
+        dynamic_cast<Compiled*>(graph.outputs()[1].primitive_ptr().get()));
+    CHECK(allclose(graph.outputs()[0], sine).item<bool>());
+    CHECK(allclose(graph.outputs()[1], cosine).item<bool>());
+  }
+}
+
+TEST_CASE("test compile horizontal fusion bounds large output groups") {
+  auto x = array({-0.5f, 0.25f, 1.0f, 2.0f});
+  std::vector<array> outputs;
+  for (int i = 0; i < 60; ++i) {
+    outputs.push_back(sin(x));
+  }
+  auto graph = optimize_fusion({x}, outputs);
+  for (const auto& output : graph.outputs()) {
+    REQUIRE(dynamic_cast<Compiled*>(output.primitive_ptr().get()));
+    CHECK_LE(output.outputs().size() + output.inputs().size(), 24);
+  }
+  for (const auto& output : graph.outputs()) {
+    CHECK(allclose(output, sin(x)).item<bool>());
+  }
+}
+
 TEST_CASE("test compile graph isolation and cleanup") {
   auto x = array({-1.0f, 2.0f});
   auto inner = copy(x);

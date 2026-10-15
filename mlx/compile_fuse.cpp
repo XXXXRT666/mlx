@@ -1,5 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
+#include <algorithm>
+#include <map>
+
 #include <fmt/format.h>
 
 #include "mlx/compile_impl.h"
@@ -60,7 +63,7 @@ bool is_fusable(const Primitive& p) {
 std::unordered_set<uintptr_t> collect_fusable_nodes(
     CompileGraph& graph,
     const CompileContext& context,
-    const array& root) {
+    std::span<const array> roots) {
   std::function<void(const array&, int, const Stream&)> recurse;
   std::unordered_set<uintptr_t> cache;
   std::unordered_set<uintptr_t> input_set;
@@ -82,7 +85,7 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
       // A broadcast root can materialize a larger contiguous output.
       reason = "broadcast_output_materialization";
     } else if (graph.is_output(a)) {
-      auto same_shape = context.same_shape(a, root);
+      auto same_shape = context.same_shape(a, roots.back());
       if (same_shape != ShapeCheck::True) {
         reason = same_shape == ShapeCheck::False ? "output_shape_mismatch"
                                                  : "output_shape_not_proven";
@@ -147,9 +150,10 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
     }
   };
 
-  if (root.has_primitive()) {
-    Stream s = root.primitive().stream();
-    recurse(root, 0, s);
+  for (const auto& root : roots) {
+    if (root.has_primitive()) {
+      recurse(root, 0, root.primitive().stream());
+    }
   }
   return cache;
 }
@@ -157,7 +161,7 @@ std::unordered_set<uintptr_t> collect_fusable_nodes(
 void fuse_subgraph(
     CompileGraph& graph,
     const CompileContext& context,
-    const array& root,
+    std::span<const array> roots,
     const std::unordered_set<uintptr_t>& cache,
     const std::unordered_set<uintptr_t>& input_ids) {
   // Collect inputs and order the selected nodes in a topological tape.
@@ -183,15 +187,21 @@ void fuse_subgraph(
     }
     fused_tape.push_back(a);
   };
-  recurse_tape(root);
+  for (const auto& root : roots) {
+    recurse_tape(root);
+  }
 
   std::vector<array> old_outputs;
-  for (size_t j = 0; j + 1 < fused_tape.size(); ++j) {
-    if (graph.is_output(fused_tape[j])) {
-      old_outputs.push_back(fused_tape[j]);
+  for (const auto& node : fused_tape) {
+    if (graph.is_output(node)) {
+      old_outputs.push_back(node);
     }
   }
-  old_outputs.push_back(root);
+  for (const auto& root : roots) {
+    if (!graph.is_output(root)) {
+      old_outputs.push_back(root);
+    }
+  }
 
   std::vector<Shape> shapes;
   std::vector<Dtype> types;
@@ -224,16 +234,18 @@ void fuse_subgraph(
       inputs);
 
   graph.replace_outputs(old_outputs, compiled_outputs);
+  auto rule =
+      roots.size() > 1 ? "horizontal_pointwise_region" : "pointwise_region";
   if (context.log.enabled(CompileLogCategory::Passes)) {
     for (size_t i = 0; i < old_outputs.size(); ++i) {
-      context.log_rewrite(
-          "pointwise_region", old_outputs[i], compiled_outputs[i]);
+      context.log_rewrite(rule, old_outputs[i], compiled_outputs[i]);
     }
   }
   context.log.write(CompileLogCategory::Fusion, [&] {
     return fmt::format(
-        "rule=pointwise_region node={} reason=accepted primitive={}",
-        root.id(),
+        "rule={} node={} reason=accepted primitive={}",
+        rule,
+        roots.back().id(),
         compiled_outputs.back().primitive_id());
   });
 }
@@ -242,6 +254,74 @@ void fuse_subgraph(
 
 bool is_pointwise(const Primitive& p) {
   return is_unary(p) || is_binary(p) || is_ternary(p);
+}
+
+void fuse_horizontal_pointwise(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  if (graph.outputs().size() < 2) {
+    return;
+  }
+  std::unordered_set<uintptr_t> input_ids;
+  for (const auto& input : graph.inputs()) {
+    input_ids.insert(input.id());
+  }
+  std::unordered_set<uintptr_t> seen;
+  std::map<std::pair<uintptr_t, Stream>, std::vector<array>> groups;
+  for (const auto& output : graph.outputs()) {
+    auto consumers = graph.consumers().find(output.id());
+    if (!seen.insert(output.id()).second || !output.has_primitive() ||
+        !is_pointwise(output.primitive()) ||
+        (consumers != graph.consumers().end() && !consumers->second.empty())) {
+      continue;
+    }
+    for (const auto& input : output.inputs()) {
+      auto& group = groups[{input.id(), output.primitive().stream()}];
+      if (group.empty() || group.back().id() != output.id()) {
+        group.push_back(output);
+      }
+    }
+  }
+  for (const auto& [_, group] : groups) {
+    for (size_t offset = 0; offset < group.size();
+         offset += max_compile_arrays) {
+      std::vector<array> roots;
+      auto end = std::min(group.size(), offset + max_compile_arrays);
+      for (size_t i = offset; i < end; ++i) {
+        const auto& root = group[i];
+        if (!graph.contains(root)) {
+          continue;
+        }
+        auto shape = roots.empty() ? ShapeCheck::True
+                                   : context.same_shape(root, roots[0]);
+        if (shape != ShapeCheck::True) {
+          context.log.write(CompileLogCategory::Fusion, [&] {
+            return fmt::format(
+                "rule=horizontal_pointwise_region node={} reason={}",
+                root.id(),
+                shape == ShapeCheck::False ? "output_shape_mismatch"
+                                           : "output_shape_not_proven");
+          });
+          continue;
+        }
+        roots.push_back(root);
+      }
+      // Each fusion removes at least two roots from this bounded group.
+      while (roots.size() > 1) {
+        auto nodes = collect_fusable_nodes(graph, context, roots);
+        auto selected = roots;
+        std::erase_if(selected, [&](const auto& root) {
+          return !nodes.contains(root.id());
+        });
+        if (selected.size() < 2) {
+          break;
+        }
+        fuse_subgraph(graph, context, selected, nodes, input_ids);
+        std::erase_if(
+            roots, [&](const auto& root) { return !graph.contains(root); });
+      }
+    }
+  }
 }
 
 void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
@@ -257,7 +337,8 @@ void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
     if (!graph.contains(root)) {
       continue;
     }
-    auto nodes = collect_fusable_nodes(graph, context, root);
+    std::span<const array> roots(&root, 1);
+    auto nodes = collect_fusable_nodes(graph, context, roots);
     if (nodes.size() <= 1) {
       if (nodes.size() == 1) {
         context.log.write(CompileLogCategory::Fusion, [&] {
@@ -269,7 +350,7 @@ void fuse_pointwise(CompileGraph& graph, const CompileContext& context) {
       }
       continue;
     }
-    fuse_subgraph(graph, context, root, nodes, input_ids);
+    fuse_subgraph(graph, context, roots, nodes, input_ids);
   }
 }
 

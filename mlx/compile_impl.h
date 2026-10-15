@@ -169,6 +169,9 @@ void eliminate_algebraic_identities(
     CompileGraph& graph,
     const CompileContext& context);
 void fuse_pointwise(CompileGraph& graph, const CompileContext& context);
+void fuse_horizontal_pointwise(
+    CompileGraph& graph,
+    const CompileContext& context);
 
 bool is_pointwise(const Primitive& primitive);
 void reorder_pointwise_views(

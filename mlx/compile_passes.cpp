@@ -86,6 +86,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
        PassScope::CompileAndExport},
   };
   static constexpr PassSpec fusion_passes[] = {
+      {"fuse_horizontal_pointwise",
+       fuse_horizontal_pointwise,
+       PassScope::CompileOnly},
       {"fuse_pointwise", fuse_pointwise, PassScope::CompileOnly},
   };
   if (context.target == CompileTarget::Export ||
