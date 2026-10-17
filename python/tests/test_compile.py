@@ -192,6 +192,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "simplify_uniform_cumsum",
                         "eliminate_algebraic_identities",
                         "eliminate_common_subexpressions",
+                        "reuse_minmax_reductions",
                         "fuse_horizontal_pointwise",
                         "fuse_pointwise",
                     )

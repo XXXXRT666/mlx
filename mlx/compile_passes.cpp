@@ -87,6 +87,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
       {"eliminate_common_subexpressions",
        eliminate_common_subexpressions,
        PassScope::CompileAndExport},
+      {"reuse_minmax_reductions",
+       reuse_minmax_reductions,
+       PassScope::CompileAndExport},
   };
   static constexpr PassSpec fusion_passes[] = {
       {"fuse_horizontal_pointwise",

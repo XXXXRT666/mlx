@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <optional>
 
@@ -775,6 +776,85 @@ void simplify_uniform_cumsum(
     }
     graph.replace_outputs({node}, {output});
     context.log_rewrite("uniform_cumsum", node, output);
+  }
+}
+
+void reuse_minmax_reductions(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  std::vector<std::pair<array, std::vector<int>>> candidates;
+  for (const auto& node : graph.tape()) {
+    auto* reduce = dynamic_cast<Reduce*>(node.primitive_ptr().get());
+    if (!reduce) {
+      continue;
+    }
+    auto [type, axes] = reduce->state();
+    if ((type != Reduce::Min && type != Reduce::Max) || axes.size() < 2) {
+      continue;
+    }
+    if (node.dtype() != bool_ && !issubdtype(node.dtype(), integer)) {
+      log_skip(context, node, "reduction_dtype_not_supported");
+      continue;
+    }
+    candidates.emplace_back(node, std::move(axes));
+  }
+  // Reuse broader reductions before changing their inputs.
+  std::stable_sort(
+      candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return a.second.size() > b.second.size();
+      });
+  for (const auto& [node, axes] : candidates) {
+    if (!graph.contains(node)) {
+      continue;
+    }
+    auto input = node.inputs()[0];
+    bool proven = std::all_of(axes.begin(), axes.end(), [&](int axis) {
+      return input.shape(axis) > 0 &&
+          context.dimension_is(input, axis, input.shape(axis)) ==
+          ShapeCheck::True;
+    });
+    if (!proven) {
+      log_skip(context, node, "nonempty_shape_not_proven");
+      continue;
+    }
+    auto type = static_cast<Reduce&>(node.primitive()).state().first;
+    auto stream = node.primitive().stream();
+    std::optional<array> local;
+    std::vector<int> local_axes;
+    for (const auto& [consumer, _] : graph.consumers().at(input.id())) {
+      auto* reduce = dynamic_cast<Reduce*>(consumer.primitive_ptr().get());
+      if (!reduce || reduce->stream() != stream ||
+          consumer.dtype() != node.dtype()) {
+        continue;
+      }
+      auto [other_type, other_axes] = reduce->state();
+      if (other_type == type && !other_axes.empty() &&
+          other_axes.size() < axes.size() &&
+          consumer.size() < (local ? local->size() : input.size()) &&
+          std::includes(
+              axes.begin(), axes.end(), other_axes.begin(), other_axes.end())) {
+        local = consumer;
+        local_axes = std::move(other_axes);
+      }
+    }
+    if (!local) {
+      continue;
+    }
+    std::vector<int> remaining;
+    std::set_difference(
+        axes.begin(),
+        axes.end(),
+        local_axes.begin(),
+        local_axes.end(),
+        std::back_inserter(remaining));
+    auto output = type == Reduce::Max ? max(*local, remaining, true, stream)
+                                      : min(*local, remaining, true, stream);
+    if (context.same_shape(node, output) != ShapeCheck::True) {
+      log_skip(context, node, "shape_not_proven");
+      continue;
+    }
+    graph.replace_outputs({node}, {output});
+    context.log_rewrite("reuse_minmax", node, output);
   }
 }
 

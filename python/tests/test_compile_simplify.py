@@ -624,6 +624,72 @@ mx.compile(lambda c: mx.cumsum(mx.full((8,), c)))(mx.array(0.1))
         self.assertIn("event=rewrite rule=uniform_cumsum", stderr)
         self.assertIn("reason=scan_dtype_not_supported", stderr)
 
+    def test_reuse_minmax_reductions(self):
+        for dtype in (
+            mx.bool_,
+            mx.int8,
+            mx.uint8,
+            mx.int16,
+            mx.uint16,
+            mx.int32,
+            mx.uint32,
+            mx.int64,
+            mx.uint64,
+        ):
+            for reduce in (mx.min, mx.max):
+                for keepdims in (False, True):
+
+                    def fun(x):
+                        local = reduce(x, axis=1, keepdims=keepdims)
+                        middle = reduce(x, axis=(0, 1), keepdims=keepdims)
+                        total = reduce(x, keepdims=keepdims)
+                        return total, local, middle, total
+
+                    compiled = mx.compile(fun)
+                    x = (mx.arange(48).reshape(2, 3, 8) - 24).astype(dtype)
+                    for value in (x, x[:, ::-1, ::2], x.transpose(2, 1, 0)):
+                        self.assert_outputs(compiled(value), fun(value))
+
+    def test_reuse_minmax_replay_and_export(self):
+        def fun(x):
+            return mx.max(x, axis=1), mx.max(x), mx.min(x, axis=0), mx.min(x)
+
+        for shapeless in (False, True):
+            compiled = mx.compile(fun, shapeless=shapeless)
+            shapes = ((2, 3), (3, 7)) if shapeless else ((2, 3), (3, 7), (1, 5), (4, 1))
+            for shape in shapes:
+                x = mx.arange(shape[0] * shape[1]).reshape(shape)
+                self.assert_outputs(compiled(x), fun(x))
+
+        x = mx.arange(24).reshape(4, 6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "minmax.mlxfn")
+            mx.export_function(path, fun, x)
+            imported = mx.import_function(path)
+            self.assert_outputs(imported(-x), fun(-x))
+        batch = mx.stack([x, -x])
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            self.assert_outputs(mapped(batch), mx.vmap(fun)(batch))
+
+        for dtype in (mx.float16, mx.bfloat16, mx.float32):
+            value = mx.array([[0.0, -0.0], [float("nan"), float("inf")]], dtype)
+            self.assert_outputs(mx.compile(fun)(value), fun(value))
+
+    def test_reuse_minmax_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+fun = lambda x: (mx.max(x, axis=1), mx.max(x))
+x = mx.arange(12).reshape(3, 4)
+mx.compile(fun)(x)
+mx.compile(fun, shapeless=True)(x)
+mx.compile(fun)(x.astype(mx.float32))
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=reuse_minmax", stderr)
+        self.assertIn("reason=nonempty_shape_not_proven", stderr)
+        self.assertIn("reason=reduction_dtype_not_supported", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

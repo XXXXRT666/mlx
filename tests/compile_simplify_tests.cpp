@@ -681,3 +681,61 @@ TEST_CASE("test compile uniform cumsum guards") {
     CHECK(array_equal(graph.outputs()[0], output).item<bool>());
   }
 }
+
+TEST_CASE("test compile reuse minmax reductions") {
+  for (auto dtype :
+       {bool_, int8, uint8, int16, uint16, int32, uint32, int64, uint64}) {
+    auto x = astype(reshape(arange(24) - array(12), {2, 3, 4}), dtype);
+    for (bool maximum : {false, true}) {
+      auto reduce = [&](const std::vector<int>& axes) {
+        return maximum ? max(x, axes, true) : min(x, axes, true);
+      };
+      auto local = reduce({1});
+      auto middle = reduce({0, 1});
+      auto total = reduce({0, 1, 2});
+      auto graph = optimize({x}, {total, local, middle, total});
+      CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[3].id());
+      CHECK_EQ(graph.outputs()[0].inputs()[0].id(), graph.outputs()[2].id());
+      CHECK_EQ(graph.outputs()[2].inputs()[0].id(), graph.outputs()[1].id());
+      CHECK_EQ(graph.outputs()[1].inputs()[0].id(), x.id());
+      CHECK(array_equal(graph.outputs()[0], total).item<bool>());
+      CHECK(array_equal(graph.outputs()[1], local).item<bool>());
+      CHECK(array_equal(graph.outputs()[2], middle).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test compile reuse minmax through consumers") {
+  auto x = reshape(arange(24), {2, 3, 4});
+  auto local = max(x, 1, true);
+  auto total = max(x, std::vector<int>{0, 1}, true);
+  auto output = local + array(1);
+  auto graph = optimize({x}, {output, total});
+  CHECK_EQ(
+      graph.outputs()[1].inputs()[0].id(), graph.outputs()[0].inputs()[0].id());
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  CHECK(array_equal(graph.outputs()[1], total).item<bool>());
+}
+
+TEST_CASE("test compile reuse minmax guards") {
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 6; ++variant) {
+    auto x = reshape(arange(24, variant == 0 ? float32 : int32), {2, 3, 4});
+    auto local = variant == 1
+        ? min(x, 1, true)
+        : max(x,
+              variant == 2 ? 2 : 1,
+              true,
+              variant == 3 ? stream : default_stream(default_device()));
+    auto total = variant == 4 ? sum(x, std::vector<int>{0, 1}, true)
+                              : max(x, std::vector<int>{0, 1}, true);
+    auto graph = optimize({x}, {local, total}, variant == 5);
+    CHECK_EQ(graph.outputs()[1].inputs()[0].id(), x.id());
+    CHECK(array_equal(graph.outputs()[1], total).item<bool>());
+  }
+  auto empty = zeros({0, 3, 4}, int32);
+  auto graph = optimize(
+      {empty}, {max(empty, 1, true), max(empty, std::vector<int>{1, 2}, true)});
+  CHECK_EQ(graph.outputs()[1].size(), 0);
+  CHECK_EQ(graph.outputs()[1].inputs()[0].id(), empty.id());
+}
