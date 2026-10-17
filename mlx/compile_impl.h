@@ -171,6 +171,9 @@ void simplify_uniform_cumsum(
 void reuse_minmax_reductions(
     CompileGraph& graph,
     const CompileContext& context);
+void simplify_uniform_scatter(
+    CompileGraph& graph,
+    const CompileContext& context);
 void eliminate_algebraic_identities(
     CompileGraph& graph,
     const CompileContext& context);

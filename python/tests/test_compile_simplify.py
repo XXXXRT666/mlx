@@ -690,6 +690,113 @@ mx.compile(fun)(x.astype(mx.float32))
         self.assertIn("reason=nonempty_shape_not_proven", stderr)
         self.assertIn("reason=reduction_dtype_not_supported", stderr)
 
+    def test_uniform_scatter(self):
+        for dtype in (
+            mx.bool_,
+            mx.int8,
+            mx.uint8,
+            mx.int16,
+            mx.uint16,
+            mx.int32,
+            mx.uint32,
+            mx.float16,
+            mx.bfloat16,
+            mx.float32,
+        ):
+            for axis in (0, 1, 2):
+                for arg in (mx.argmin, mx.argmax):
+
+                    def fun(x):
+                        indices = arg(x, axis=axis, keepdims=True)
+                        base = mx.zeros(x.shape, dtype)
+                        output = mx.put_along_axis(
+                            base, indices, mx.array(1), axis=axis
+                        )
+                        return output, indices, base, output
+
+                    compiled = mx.compile(fun)
+                    x = mx.arange(60, dtype=mx.float32).reshape(3, 4, 5)
+                    for value in (x, x[:, ::-1, :], x.transpose(2, 1, 0)):
+                        self.assert_outputs(compiled(value), fun(value))
+
+    def test_uniform_scatter_replay_and_export(self):
+        def fun(x):
+            indices = mx.argmax(x, axis=-1, keepdims=True)
+            return mx.put_along_axis(mx.zeros_like(x), indices, mx.array(1), axis=-1)
+
+        for shapeless in (False, True):
+            compiled = mx.compile(fun, shapeless=shapeless)
+            for shape in ((2, 3), (3, 7), (1, 5), (4, 1)):
+                x = mx.arange(shape[0] * shape[1], dtype=mx.float32).reshape(shape)
+                self.assert_outputs(compiled(x), fun(x))
+                self.assert_outputs(compiled(-x), fun(-x))
+
+        x = mx.array([[float("nan"), float("nan"), 0.0], [-0.0, 0.0, -0.0]])
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "scatter.mlxfn")
+            mx.export_function(path, fun, x)
+            imported = mx.import_function(path)
+            self.assert_outputs(imported(x), fun(x))
+        batch = mx.stack([x, -x])
+        for mapped in (mx.vmap(mx.compile(fun)), mx.compile(mx.vmap(fun))):
+            self.assert_outputs(mapped(batch), mx.vmap(fun)(batch))
+
+    def test_uniform_scatter_runtime_constants_and_indices(self):
+        def fun(x, zero, one):
+            base = mx.full(x.shape, zero)
+            return mx.put_along_axis(
+                base, mx.argmax(x, axis=1, keepdims=True), one, axis=1
+            )
+
+        x = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+        compiled = mx.compile(fun)
+        for zero, one in ((0.0, 1.0), (2.0, -3.0), (-0.0, 1.0)):
+            args = (x, mx.array(zero), mx.array(one))
+            self.assert_outputs(
+                compiled(*args).view(mx.uint32), fun(*args).view(mx.uint32)
+            )
+
+        def scatter(indices):
+            return mx.put_along_axis(mx.zeros((2, 3)), indices, mx.array(1), axis=1)
+
+        compiled = mx.compile(scatter)
+        for indices in (
+            mx.array([[0], [2]]),
+            mx.array([[-1], [-3]]),
+            mx.array([[1, 1], [0, 0]]),
+        ):
+            self.assert_outputs(compiled(indices), scatter(indices))
+
+        def wide(x):
+            return mx.put_along_axis(
+                mx.zeros(x.shape, mx.int64),
+                mx.argmax(x, axis=1, keepdims=True),
+                mx.array(1),
+                axis=1,
+            )
+
+        if mx.default_device() == mx.gpu:
+            with self.assertRaisesRegex(ValueError, "Does not support"):
+                mx.eval(mx.compile(wide)(x))
+        else:
+            self.assert_outputs(mx.compile(wide)(x), wide(x))
+
+    def test_uniform_scatter_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+def fun(x):
+    indices = mx.argmax(x, axis=1, keepdims=True)
+    return mx.put_along_axis(mx.zeros(x.shape), indices, mx.array(1), axis=1)
+x = mx.arange(12, dtype=mx.float32).reshape(3, 4)
+mx.compile(fun)(x)
+external = lambda i: mx.put_along_axis(mx.zeros((3, 4)), i, mx.array(1), axis=1)
+mx.compile(external)(mx.zeros((3, 1), mx.int32))
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=uniform_scatter", stderr)
+        self.assertIn("reason=index_bounds_not_proven", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

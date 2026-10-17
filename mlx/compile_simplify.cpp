@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -86,7 +87,7 @@ std::optional<bool> fold_boolean(
   return std::nullopt;
 }
 
-bool is_identity_constant(
+bool is_uniform_constant(
     array scalar,
     uint64_t value,
     const std::unordered_set<uintptr_t>& input_ids,
@@ -97,22 +98,40 @@ bool is_identity_constant(
       return false;
     }
     auto& p = scalar.primitive();
-    auto integral = [](Dtype dtype) {
-      return dtype == bool_ || issubdtype(dtype, integer);
+    auto real = [](Dtype dtype) {
+      return dtype == bool_ || issubdtype(dtype, integer) ||
+          issubdtype(dtype, floating);
     };
     bool broadcast = typeid(p) == typeid(Broadcast) &&
         scalar.inputs().size() == 1 && scalar.inputs()[0].ndim() == 0;
-    // Zero and one are exact through integer and bool casts.
+    // Zero and one are exact through real numeric casts.
     bool cast = typeid(p) == typeid(AsType) && scalar.ndim() == 0 &&
-        integral(scalar.dtype()) && integral(scalar.inputs()[0].dtype());
+        real(scalar.dtype()) && real(scalar.inputs()[0].dtype());
     if (!broadcast && !cast) {
       return false;
     }
     scalar = scalar.inputs()[0];
   }
   if (scalar.ndim() != 0 || !scalar.is_available() ||
-      input_ids.contains(scalar.id()) ||
-      !(scalar.dtype() == bool_ || issubdtype(scalar.dtype(), integer))) {
+      input_ids.contains(scalar.id())) {
+    return false;
+  }
+  auto same_value = [value](double actual) {
+    return actual == value && !std::signbit(actual);
+  };
+  switch (scalar.dtype()) {
+    case float16:
+      return same_value(*scalar.data<float16_t>());
+    case bfloat16:
+      return same_value(*scalar.data<bfloat16_t>());
+    case float32:
+      return same_value(*scalar.data<float>());
+    case float64:
+      return same_value(*scalar.data<double>());
+    default:
+      break;
+  }
+  if (scalar.dtype() != bool_ && !issubdtype(scalar.dtype(), integer)) {
     return false;
   }
   switch (scalar.itemsize()) {
@@ -858,6 +877,67 @@ void reuse_minmax_reductions(
   }
 }
 
+void simplify_uniform_scatter(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  std::unordered_set<uintptr_t> input_ids;
+  for (const auto& input : graph.inputs()) {
+    input_ids.insert(input.id());
+  }
+  auto candidates = graph.tape();
+  for (const auto& node : candidates) {
+    auto* scatter = dynamic_cast<ScatterAxis*>(node.primitive_ptr().get());
+    if (!graph.contains(node) || !scatter) {
+      continue;
+    }
+    auto [type, axis] = scatter->state();
+    if (type != ScatterAxis::None) {
+      continue;
+    }
+    if (node.itemsize() > 4) {
+      log_skip(context, node, "scatter_dtype_not_supported");
+      continue;
+    }
+    const auto& base = node.inputs()[0];
+    const auto& indices = node.inputs()[1];
+    const auto& updates = node.inputs()[2];
+    auto* arg = dynamic_cast<ArgReduce*>(indices.primitive_ptr().get());
+    if (!arg || arg->state().second != axis) {
+      log_skip(context, node, "index_bounds_not_proven");
+      continue;
+    }
+    auto stream = scatter->stream();
+    if (arg->stream() != stream) {
+      log_skip(context, node, "stream_mismatch");
+      continue;
+    }
+    if (!is_uniform_constant(base, 0, input_ids, stream) ||
+        !is_uniform_constant(updates, 1, input_ids, stream)) {
+      log_skip(context, node, "constant_value_not_proven");
+      continue;
+    }
+    int size = base.shape(axis);
+    if (size == 0 ||
+        context.same_shape(indices.inputs()[0], base) != ShapeCheck::True ||
+        context.dimension_is(indices, axis, 1) != ShapeCheck::True ||
+        context.same_shape(indices, updates) != ShapeCheck::True) {
+      log_skip(context, node, "scatter_domain_not_proven");
+      continue;
+    }
+    Shape shape(base.ndim(), 1);
+    shape[axis] = size;
+    auto positions = reshape(arange(size, uint32, stream), shape, stream);
+    auto output =
+        astype(equal(positions, indices, stream), node.dtype(), stream);
+    if (context.same_shape(node, output) != ShapeCheck::True) {
+      log_skip(context, node, "shape_not_proven");
+      continue;
+    }
+    graph.replace_outputs({node}, {output});
+    context.log_rewrite("uniform_scatter", node, output);
+  }
+}
+
 void eliminate_algebraic_identities(
     CompileGraph& graph,
     const CompileContext& context) {
@@ -882,11 +962,11 @@ void eliminate_algebraic_identities(
       continue;
     }
     int retained = -1;
-    if (is_identity_constant(node.inputs()[1], one, input_ids, p.stream())) {
+    if (is_uniform_constant(node.inputs()[1], one, input_ids, p.stream())) {
       retained = 0;
     } else if (
         !subtract &&
-        is_identity_constant(node.inputs()[0], one, input_ids, p.stream())) {
+        is_uniform_constant(node.inputs()[0], one, input_ids, p.stream())) {
       retained = 1;
     }
     if (retained < 0) {

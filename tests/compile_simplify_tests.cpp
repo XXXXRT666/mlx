@@ -739,3 +739,68 @@ TEST_CASE("test compile reuse minmax guards") {
   CHECK_EQ(graph.outputs()[1].size(), 0);
   CHECK_EQ(graph.outputs()[1].inputs()[0].id(), empty.id());
 }
+
+TEST_CASE("test compile uniform scatter") {
+  auto x = reshape(arange(60, float32), {3, 4, 5});
+  for (auto dtype :
+       {bool_,
+        int8,
+        uint8,
+        int16,
+        uint16,
+        int32,
+        uint32,
+        float16,
+        bfloat16,
+        float32}) {
+    for (int axis : {0, 1, 2}) {
+      for (bool maximum : {false, true}) {
+        auto indices = maximum ? argmax(x, axis, true) : argmin(x, axis, true);
+        auto base = zeros(x.shape(), dtype);
+        auto output = put_along_axis(base, indices, array(1, dtype), axis);
+        auto graph = optimize({x}, {output, indices, base, output});
+        CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[3].id());
+        CHECK_EQ(graph.outputs()[0].dtype(), dtype);
+        for (const auto& node : graph.tape()) {
+          CHECK_FALSE(dynamic_cast<ScatterAxis*>(node.primitive_ptr().get()));
+        }
+        CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+        CHECK(array_equal(graph.outputs()[1], indices).item<bool>());
+        CHECK(array_equal(graph.outputs()[2], base).item<bool>());
+      }
+    }
+  }
+}
+
+TEST_CASE("test compile uniform scatter guards") {
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 10; ++variant) {
+    auto x = reshape(arange(6, float32), {2, 3});
+    auto zero = array(variant == 3 ? -0.0f : 0.0f);
+    auto one = array(variant == 4 ? 2.0f : 1.0f);
+    auto base = full(variant == 5 ? Shape{2, 4} : x.shape(), zero);
+    auto indices = argmax(
+        x, 1, true, variant == 6 ? stream : default_stream(default_device()));
+    std::vector<array> inputs{x};
+    if (variant == 0) {
+      inputs.push_back(indices);
+    } else if (variant == 1) {
+      inputs.push_back(zero);
+    } else if (variant == 2) {
+      inputs.push_back(one);
+    } else if (variant == 8) {
+      indices = concatenate({indices, indices}, 1);
+    }
+    auto output = variant == 9 ? scatter_add_axis(base, indices, one, 1)
+                               : put_along_axis(base, indices, one, 1);
+    auto graph = optimize(inputs, {output}, variant == 7);
+    CHECK(dynamic_cast<ScatterAxis*>(graph.outputs()[0].primitive_ptr().get()));
+    CHECK(array_equal(view(graph.outputs()[0], uint32), view(output, uint32))
+              .item<bool>());
+  }
+  auto x = reshape(arange(6), {2, 3});
+  auto output =
+      put_along_axis(zeros({2, 3}, int64), argmax(x, 1, true), array(1), 1);
+  auto graph = optimize({x}, {output});
+  CHECK(dynamic_cast<ScatterAxis*>(graph.outputs()[0].primitive_ptr().get()));
+}

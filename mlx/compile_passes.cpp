@@ -90,6 +90,9 @@ void compile_optimize(CompileGraph& graph, const CompileContext& context) {
       {"reuse_minmax_reductions",
        reuse_minmax_reductions,
        PassScope::CompileAndExport},
+      {"simplify_uniform_scatter",
+       simplify_uniform_scatter,
+       PassScope::CompileAndExport},
   };
   static constexpr PassSpec fusion_passes[] = {
       {"fuse_horizontal_pointwise",
