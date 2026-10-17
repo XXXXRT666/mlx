@@ -719,6 +719,65 @@ void fold_uniform_values(CompileGraph& graph, const CompileContext& context) {
   }
 }
 
+void simplify_uniform_cumsum(
+    CompileGraph& graph,
+    const CompileContext& context) {
+  auto candidates = graph.tape();
+  for (const auto& node : candidates) {
+    auto* scan = dynamic_cast<Scan*>(node.primitive_ptr().get());
+    if (!graph.contains(node) || !scan) {
+      continue;
+    }
+    auto [type, axis, reverse, inclusive] = scan->state();
+    if (type != Scan::Sum) {
+      continue;
+    }
+    if (!issubdtype(node.dtype(), integer)) {
+      log_skip(context, node, "scan_dtype_not_supported");
+      continue;
+    }
+    const auto& input = node.inputs()[0];
+    if (!dynamic_cast<Broadcast*>(input.primitive_ptr().get()) ||
+        input.inputs().size() != 1 || input.inputs()[0].ndim() != 0) {
+      continue;
+    }
+    auto scalar = input.inputs()[0];
+    auto stream = scan->stream();
+    if (input.primitive().stream() != stream ||
+        (scalar.has_primitive() && scalar.primitive().stream() != stream)) {
+      log_skip(context, node, "stream_mismatch");
+      continue;
+    }
+    int size = input.shape(axis);
+    if (context.dimension_is(input, axis, size) != ShapeCheck::True ||
+        context.size_at_most(scalar, input) != ShapeCheck::True) {
+      log_skip(context, node, "nonempty_shape_not_proven");
+      continue;
+    }
+    int offset = inclusive ? 1 : 0;
+    auto counts = arange(
+        reverse ? size - 1 + offset : offset,
+        reverse ? offset - 1.0 : double(size) + offset,
+        reverse ? -1 : 1,
+        int32,
+        stream);
+    auto values = multiply(
+        astype(counts, node.dtype(), stream),
+        astype(scalar, node.dtype(), stream),
+        stream);
+    Shape shape(input.ndim(), 1);
+    shape[axis] = size;
+    auto output =
+        broadcast_to(reshape(values, shape, stream), node.shape(), stream);
+    if (context.same_shape(node, output) != ShapeCheck::True) {
+      log_skip(context, node, "shape_not_proven");
+      continue;
+    }
+    graph.replace_outputs({node}, {output});
+    context.log_rewrite("uniform_cumsum", node, output);
+  }
+}
+
 void eliminate_algebraic_identities(
     CompileGraph& graph,
     const CompileContext& context) {

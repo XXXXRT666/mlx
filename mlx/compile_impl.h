@@ -165,6 +165,9 @@ void eliminate_redundant_casts(
     CompileGraph& graph,
     const CompileContext& context);
 void fold_uniform_values(CompileGraph& graph, const CompileContext& context);
+void simplify_uniform_cumsum(
+    CompileGraph& graph,
+    const CompileContext& context);
 void eliminate_algebraic_identities(
     CompileGraph& graph,
     const CompileContext& context);

@@ -189,6 +189,7 @@ assert mx.array_equal(first[::-1], second).item()
                         "eliminate_split_concat",
                         "eliminate_redundant_casts",
                         "fold_uniform_values",
+                        "simplify_uniform_cumsum",
                         "eliminate_algebraic_identities",
                         "eliminate_common_subexpressions",
                         "fuse_horizontal_pointwise",

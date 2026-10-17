@@ -613,3 +613,71 @@ TEST_CASE("test compile algebraic identity guards") {
     CHECK_EQ(graph.outputs()[1].primitive().name(), std::string("Multiply"));
   }
 }
+
+TEST_CASE("test compile uniform cumsum") {
+  for (auto dtype :
+       {bool_, int8, uint8, int16, uint16, int32, uint32, int64, uint64}) {
+    auto scalar = array(127, dtype);
+    for (int axis : {0, 1, 2}) {
+      for (bool reverse : {false, true}) {
+        for (bool inclusive : {false, true}) {
+          auto input = full({2, 5, 3}, scalar);
+          auto output = cumsum(input, axis, reverse, inclusive);
+          auto graph = optimize({scalar}, {output, input, output});
+          CHECK_EQ(graph.outputs()[0].id(), graph.outputs()[2].id());
+          CHECK_EQ(graph.outputs()[0].dtype(), output.dtype());
+          CHECK_EQ(graph.outputs()[0].shape(), output.shape());
+          for (const auto& node : graph.tape()) {
+            CHECK_FALSE(dynamic_cast<Scan*>(node.primitive_ptr().get()));
+          }
+          CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+          CHECK(array_equal(graph.outputs()[1], input).item<bool>());
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("test compile uniform cumsum overflow and promotion") {
+  for (auto scalar :
+       {array(127, int8),
+        array(255, uint8),
+        array(32767, int16),
+        array(65535, uint16),
+        array(INT32_MAX, int32),
+        array(UINT32_MAX, uint32),
+        array(INT64_MAX, int64),
+        array(UINT64_MAX, uint64)}) {
+    for (bool reverse : {false, true}) {
+      auto input = full({260}, scalar);
+      auto output = cumsum(input, 0, reverse);
+      auto graph = optimize({scalar}, {output});
+      CHECK_FALSE(
+          dynamic_cast<Scan*>(graph.outputs()[0].primitive_ptr().get()));
+      CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+    }
+  }
+  auto scalar = array(2.9f);
+  auto output = cumsum(full({4}, scalar), 0, false, true, int32);
+  auto graph = optimize({scalar}, {output});
+  CHECK_EQ(graph.outputs()[0].dtype(), int32);
+  CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+}
+
+TEST_CASE("test compile uniform cumsum guards") {
+  auto stream = new_stream(default_device());
+  for (int variant = 0; variant < 6; ++variant) {
+    auto scalar = variant == 0 ? array(0.1f) : array(3);
+    auto input = full(
+        variant == 1 ? Shape{0} : Shape{5},
+        scalar,
+        variant == 2 ? stream : default_stream(default_device()));
+    if (variant == 3) {
+      input = arange(5);
+    }
+    auto output = variant == 4 ? cumprod(input, 0) : cumsum(input, 0);
+    auto graph = optimize({scalar}, {output}, variant == 5);
+    CHECK(dynamic_cast<Scan*>(graph.outputs()[0].primitive_ptr().get()));
+    CHECK(array_equal(graph.outputs()[0], output).item<bool>());
+  }
+}

@@ -548,6 +548,82 @@ mx.compile(lambda x: x + 0, shapeless=True)(x)
         self.assertIn("event=rewrite rule=algebraic_identity", stderr)
         self.assertIn("reason=constant_value_not_proven", stderr)
 
+    def test_uniform_cumsum(self):
+        for dtype in (
+            mx.bool_,
+            mx.int8,
+            mx.uint8,
+            mx.int16,
+            mx.uint16,
+            mx.int32,
+            mx.uint32,
+            mx.int64,
+            mx.uint64,
+        ):
+            traces = []
+
+            def fun(c):
+                traces.append(1)
+                x = mx.full((2, 260), c)
+                return tuple(
+                    mx.cumsum(x, axis=axis, reverse=reverse, inclusive=inclusive)
+                    for axis in (0, 1)
+                    for reverse in (False, True)
+                    for inclusive in (False, True)
+                )
+
+            compiled = mx.compile(fun)
+            for value in (0, 1, -1, 127):
+                scalar = mx.array(value).astype(dtype)
+                actual = compiled(scalar)
+                self.assertEqual(len(traces), 1)
+                x = mx.full((2, 260), scalar)
+                expected = tuple(
+                    mx.cumsum(x, axis=axis, reverse=reverse, inclusive=inclusive)
+                    for axis in (0, 1)
+                    for reverse in (False, True)
+                    for inclusive in (False, True)
+                )
+                self.assert_outputs(actual, expected)
+
+    def test_uniform_cumsum_shapes_and_export(self):
+        def fun(c, x):
+            uniform = mx.broadcast_arrays(c, x)[0]
+            return mx.cumsum(uniform, axis=-1), mx.cumsum(uniform, axis=0)
+
+        for shapeless in (False, True):
+            compiled = mx.compile(fun, shapeless=shapeless)
+            for shape in ((2, 3), (3, 7), (0, 3), (2, 0)):
+                x = mx.zeros(shape, mx.int32).T
+                for c in (mx.array(3), mx.array(-7)):
+                    self.assert_outputs(compiled(c, x), fun(c, x))
+
+        def scan(c):
+            return mx.cumsum(mx.full((4, 7), c * c + c), axis=1)
+
+        c = mx.array(3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "cumsum.mlxfn")
+            mx.export_function(path, scan, c)
+            imported = mx.import_function(path)
+            for value in (3, -4):
+                scalar = mx.array(value)
+                self.assert_outputs(imported(scalar), scan(scalar))
+        batch = mx.array([2, 3, -4])
+        for mapped in (mx.vmap(mx.compile(scan)), mx.compile(mx.vmap(scan))):
+            self.assert_outputs(mapped(batch), mx.vmap(scan)(batch))
+
+    def test_uniform_cumsum_logs(self):
+        stderr = self.run_compile_log_test(
+            """
+mx.compile(lambda c: mx.cumsum(mx.full((8,), c)))(mx.array(3))
+mx.compile(lambda c: mx.cumsum(mx.full((8,), c)))(mx.array(0.1))
+""",
+            "passes,guards",
+        )
+        self.assertIn("event=rewrite rule=uniform_cumsum", stderr)
+        self.assertIn("reason=scan_dtype_not_supported", stderr)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
